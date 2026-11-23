@@ -77,6 +77,43 @@ def compute_rms_db(samples: np.ndarray) -> float:
     return float(10.0 * np.log10(mean_square))
 
 
+class PCM16Coalescer:
+    """Merge small PCM16 pieces into frames of at least ``min_ms`` of audio.
+
+    Network TTS streams arrive in arbitrary byte sizes, often a few
+    milliseconds each. Sending each piece as its own WebSocket message means
+    hundreds of tiny browser audio buffers, and every join is a chance to
+    click or gap. Coalescing yields fewer, larger, sample-aligned frames.
+    Pieces already larger than ``min_ms`` pass straight through, so this
+    never delays a backend that already emits big chunks.
+    """
+
+    def __init__(self, sample_rate: int, min_ms: int = 160, channels: int = 1):
+        self._bytes_per_sample = 2 * channels
+        self._min_bytes = max(
+            self._bytes_per_sample,
+            int(sample_rate * min_ms / 1000) * self._bytes_per_sample,
+        )
+        self._buffer = bytearray()
+
+    def push(self, pcm: bytes) -> bytes | None:
+        """Add audio; return a frame once enough is buffered, else ``None``."""
+        self._buffer.extend(pcm)
+        if len(self._buffer) < self._min_bytes:
+            return None
+        usable = len(self._buffer) - (len(self._buffer) % self._bytes_per_sample)
+        frame = bytes(self._buffer[:usable])
+        del self._buffer[:usable]
+        return frame
+
+    def flush(self) -> bytes:
+        """Return whatever is buffered (whole samples only) and reset."""
+        usable = len(self._buffer) - (len(self._buffer) % self._bytes_per_sample)
+        frame = bytes(self._buffer[:usable])
+        self._buffer.clear()
+        return frame
+
+
 class BoundedAudioAccumulator:
     """Accumulates incoming streaming audio samples up to a maximum duration.
 

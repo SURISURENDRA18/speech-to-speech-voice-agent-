@@ -11,13 +11,12 @@ from typing import Any
 import torch
 from transformers import AutoTokenizer, TextIteratorStreamer
 
-from voice_agent.config import settings
 from voice_agent.devices import (
     empty_device_cache,
     keep_models_loaded,
     resolve_torch_device,
 )
-from voice_agent.llm.base import LLMBase
+from voice_agent.llm.base import LLMBase, build_chat_messages
 
 logger = logging.getLogger(__name__)
 
@@ -148,20 +147,9 @@ class Qwen3LLMAdapter(LLMBase):
             if not self.is_loaded:
                 await asyncio.to_thread(self.load_model)
 
-        # Build conversation messages
-        messages: list[dict[str, str]] = []
-        sys_p = system_prompt or settings.system_prompt
-        if sys_p:
-            messages.append({"role": "system", "content": sys_p})
-
-        if history:
-            # Keep only last 4 turns to bound context memory
-            messages.extend(history[-4:])
-
-        messages.append({"role": "user", "content": prompt})
-
-        # Apply chat template
-        formatted_prompt = self._format_chat_prompt(messages)
+        formatted_prompt = self._format_chat_prompt(
+            build_chat_messages(prompt, history, system_prompt)
+        )
 
         inputs = self._tokenizer(formatted_prompt, return_tensors="pt").to(self.device)
         streamer = TextIteratorStreamer(

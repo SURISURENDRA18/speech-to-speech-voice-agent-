@@ -309,6 +309,9 @@ All settings live in `.env` (see [`.env.example`](.env.example)) and are loaded 
 | `LLM_API_URL` | – | Point at a vLLM / OpenAI-compatible server instead of a local LLM |
 | `SVARA_API_URL` | – | Point at a remote Svara GPU server |
 | `CLIENT_PLAYBACK_MODE` | `auto` | `auto` · `smooth` · `fast` |
+| `CONVERSATION_MAX_TURNS` | `6` | Exchanges remembered per session and sent to the LLM |
+| `LLM_MAX_NEW_TOKENS` | `128` | Reply token cap (Indic text needs ~3 tokens/word; lower values cut replies) |
+| `TTS_MIN_FRAME_MS` | `160` | Merge tiny TTS pieces into frames at least this long (smoother playback) |
 
 <details>
 <summary><b>All options</b></summary>
@@ -327,7 +330,11 @@ See [`voice_agent/config.py`](voice_agent/config.py) for every setting, includin
 ├── voice_agent/
 │   ├── config.py              # pydantic-settings configuration
 │   ├── audio.py               # PCM conversion & resampling
-│   ├── pipeline/session.py    # per-connection pipeline, queues, barge-in
+│   ├── languages.py           # language codes & names (single source of truth)
+│   ├── pipeline/
+│   │   ├── session.py         # per-connection turn orchestration, barge-in
+│   │   ├── conversation.py    # bounded memory + reply-language system prompt
+│   │   └── segmenter.py       # token stream → clean, speakable sentences
 │   ├── vad/                   # Silero VAD streaming detector
 │   ├── stt/                   # Whisper: MLX · transformers · faster-whisper · mock
 │   ├── llm/                   # Qwen3: MLX · transformers · OpenAI-compatible · mock

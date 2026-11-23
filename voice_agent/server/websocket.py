@@ -32,7 +32,7 @@ async def voice_websocket_handler(websocket: WebSocket) -> None:
 
     # Obtain model instances from application state
     app_state = websocket.app.state
-    vad = app_state.vad
+    vad = app_state.vad_factory()  # per-session: the VAD carries stream state
     stt = app_state.stt
     llm = app_state.llm
     normalizer = app_state.normalizer

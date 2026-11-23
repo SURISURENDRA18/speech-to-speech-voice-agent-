@@ -5,6 +5,7 @@ import torch
 
 from voice_agent.audio import (
     BoundedAudioAccumulator,
+    PCM16Coalescer,
     base64_to_pcm_bytes,
     compute_rms_db,
     float32_to_pcm16,
@@ -112,3 +113,25 @@ def test_bounded_audio_accumulator():
     acc.clear()
     assert len(acc) == 0
     assert len(acc.get_audio()) == 0
+
+
+def test_pcm16_coalescer_merges_small_pieces_into_frames():
+    # 24 kHz, 100 ms minimum -> 2400 samples = 4800 bytes per frame
+    coalescer = PCM16Coalescer(sample_rate=24000, min_ms=100)
+    piece = b"\x01\x00" * 600  # 25 ms
+    assert coalescer.push(piece) is None
+    assert coalescer.push(piece) is None
+    assert coalescer.push(piece) is None
+    frame = coalescer.push(piece)
+    assert frame == piece * 4
+    assert coalescer.flush() == b""
+
+
+def test_pcm16_coalescer_passes_large_chunks_and_keeps_sample_alignment():
+    coalescer = PCM16Coalescer(sample_rate=24000, min_ms=100)
+    big = b"\x02\x00" * 3000 + b"\x07"  # 125 ms plus a dangling odd byte
+    frame = coalescer.push(big)
+    assert frame == b"\x02\x00" * 3000
+    # The odd byte waits for its partner instead of splitting a sample.
+    assert coalescer.push(b"\x00") is None
+    assert coalescer.flush() == b"\x07\x00"

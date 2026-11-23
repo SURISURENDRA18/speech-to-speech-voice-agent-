@@ -60,7 +60,8 @@ This system implements a full-duplex, low-latency, speech-to-speech conversation
 ### 2.3 Conversational LLM
 - **Model**: Qwen3 1.7B (`Qwen3ForCausalLM`).
 - **Generation**: Asynchronous token streaming. Emits sentence/phrase deltas to minimize Time-to-First-Audio (TTFA).
-- **Context Management**: Bounded conversational history (keeps recent turns) and limited output tokens (`max_tokens=128` by default) to keep memory usage low and prevent runaway latency.
+- **Context Management** (`pipeline/conversation.py`): `ConversationMemory` keeps the last `CONVERSATION_MAX_TURNS` (default 6) exchanges per session. It stores what the assistant actually *spoke* (truncated tails and unspoken sentences are excluded), and if the user interrupts before any audio plays, their utterance is carried into the next turn instead of being lost. `build_system_prompt` appends an explicit "reply in {language}" rule using the language the STT heard. Output is capped by `LLM_MAX_NEW_TOKENS` (default 128; Indic scripts need ~3 tokens per word).
+- **Sentence segmentation** (`pipeline/segmenter.py`): `SentenceSegmenter` turns the token stream into speakable sentences. It splits only at real sentence ends (never inside `2.5` or after `Dr.`), strips markdown, emojis and `<think>` tags, and drops an unterminated tail caused by the token cap.
 
 ### 2.4 Indic Text Normalization
 - **Purpose**: Normalizes numbers, dates, fractions, currency symbols, and abbreviations into their spoken forms before reaching TTS (e.g., "₹500" -> "पांच सौ रुपये" / "five hundred rupees").
@@ -76,13 +77,17 @@ This system implements a full-duplex, low-latency, speech-to-speech conversation
   - Remote/Docker Svara API endpoint (for production GPU vLLM deployments).
   - Local MPS/CPU SNAC decoder with streaming chunks.
   - Mock audio generator for fast local test suites without downloading multi-gigabyte TTS weights.
+- **Smooth playback** (why the voice does not break up):
+  - Server: `PCM16Coalescer` merges tiny TTS pieces (remote HTTP streams arrive a few ms at a time) into frames of at least `TTS_MIN_FRAME_MS` (160 ms), and keeps them sample-aligned.
+  - Server: without LLM/TTS overlap (8 GB Macs), `group_for_synthesis` merges sentences into TTS requests of up to `TTS_MAX_CHARS_PER_REQUEST`, so Svara isn't restarted for every sentence.
+  - Browser: an adaptive jitter buffer schedules audio 120 ms ahead and widens the lead (up to 600 ms) after each mid-reply underrun. A 4 ms fade-in removes clicks when playback restarts after a gap.
 
 ---
 
 ## 3. Concurrency, Queues, and Lifespan
 
 1. **Lifespan Management**:
-   Models are loaded once during FastAPI startup (`@asynccontextmanager` lifespan) and stored on `app.state`. They are shared across incoming WebSocket connections without re-initialization.
+   Models are loaded once during FastAPI startup (`@asynccontextmanager` lifespan) and stored on `app.state`. They are shared across incoming WebSocket connections without re-initialization. The Silero VAD is the exception: it carries per-stream recurrent state, so `app.state.vad_factory` builds one detector per session.
 2. **Bounded Queues**:
    Each WebSocket session has bounded audio input (`asyncio.Queue(maxsize=100)`) and output queues to prevent memory accumulation if a client stalls.
 3. **Cancellation & Cleanup**:

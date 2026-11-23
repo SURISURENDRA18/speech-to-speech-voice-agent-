@@ -5,6 +5,7 @@ import logging
 import platform
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from functools import partial
 from typing import Any
 
 import torch
@@ -32,6 +33,7 @@ from voice_agent.stt import (
 )
 from voice_agent.tts import MockTTSAdapter, SvaraTTSAdapter, load_svara_voices
 from voice_agent.vad import SileroVADDetector
+from voice_agent.vad.detector import find_silero_model_path
 
 logger = logging.getLogger(__name__)
 
@@ -62,15 +64,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Lifespan context manager: initialize and load models once at application startup."""
     logger.info("Initializing Speech-to-Speech pipeline models...")
 
-    # 1. Silero VAD v6 (TorchScript JIT)
-    logger.info("Initializing Silero VAD v6...")
-    vad = SileroVADDetector(
+    # 1. Silero VAD v6 (TorchScript JIT). The detector holds per-stream
+    # recurrent state, so every WebSocket session gets its own instance from
+    # this factory. Resolve the weights now so a missing file fails at startup.
+    logger.info("Initializing Silero VAD v6 (%s)...", find_silero_model_path())
+    app.state.vad_factory = partial(
+        SileroVADDetector,
         threshold=settings.vad_threshold,
         neg_threshold=settings.vad_neg_threshold,
         min_silence_duration_ms=settings.vad_min_silence_duration_ms,
         speech_pad_ms=settings.vad_speech_pad_ms,
     )
-    app.state.vad = vad
 
     # MLX keeps quantized STT + LLM + Svara resident together (~3.7 GB), so no
     # per-turn model swapping is needed. PyTorch adapters remain the fallback.
@@ -169,7 +173,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         preload_task.cancel()
 
     logger.info("Shutting down voice agent and releasing resources...")
-    vad.reset()
 
 
 def create_app() -> FastAPI:

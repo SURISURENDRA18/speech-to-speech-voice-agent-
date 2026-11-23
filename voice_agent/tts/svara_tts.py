@@ -19,6 +19,7 @@ import yaml
 
 from voice_agent.audio import float32_to_pcm16, pcm16_to_float32, resample_audio
 from voice_agent.config import settings
+from voice_agent.languages import base_language, language_name
 from voice_agent.tts.base import TTSAudioChunk, TTSBase
 
 logger = logging.getLogger(__name__)
@@ -295,17 +296,9 @@ class SvaraTTSAdapter(TTSBase):
     @staticmethod
     def _mlx_voice_name(voice: str, language: str | None) -> str:
         """Convert project voice IDs to Svara's language and gender voice labels."""
-        lang = (language or voice.split("_", 1)[0]).lower().split("-", 1)[0]
+        lang = base_language(language or voice.split("_", 1)[0])
         gender = voice.rsplit("_", 1)[-1].capitalize()
-        language_names = {
-            "as": "Assamese", "bn": "Bengali", "bh": "Bhojpuri",
-            "brx": "Bodo", "doi": "Dogri", "en": "English (Indian)",
-            "gu": "Gujarati", "hi": "Hindi", "hne": "Chhattisgarhi",
-            "kn": "Kannada", "mag": "Magahi", "mai": "Maithili",
-            "ml": "Malayalam", "mr": "Marathi", "ne": "Nepali",
-            "pa": "Punjabi", "sa": "Sanskrit", "ta": "Tamil", "te": "Telugu",
-        }
-        return f"{language_names.get(lang, 'Hindi')} ({gender if gender in {'Male', 'Female'} else 'Female'})"
+        return f"{language_name(lang)} ({gender if gender in {'Male', 'Female'} else 'Female'})"
 
     def _http(self) -> Any:
         import httpx

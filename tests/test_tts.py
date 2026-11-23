@@ -36,6 +36,8 @@ def test_mlx_voice_mapping_uses_requested_language_and_gender():
 
 @pytest.mark.asyncio
 async def test_svara_tts_local_stream(monkeypatch):
+    # Exercise the macOS ``say`` path even on Macs that have mlx-audio installed.
+    monkeypatch.setattr(SvaraTTSAdapter, "_mlx_available", property(lambda _self: False))
     tts = SvaraTTSAdapter(default_voice="hi_female", output_sample_rate=24000)
     # A 200 ms non-empty PCM utterance, standing in for macOS ``say`` output.
     pcm = b"\x10\x00" * (24000 // 5)

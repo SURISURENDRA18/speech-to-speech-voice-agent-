@@ -104,7 +104,7 @@
                 <label>Playback</label>
                 <select id="playbackMode">
                     <option value="smooth" selected>Smooth (play each full sentence)</option>
-                    <option value="fast">Fast start (may stutter)</option>
+                    <option value="fast">Fast start (adaptive buffer)</option>
                 </select>
             </div>
         </div>
@@ -147,6 +147,12 @@
         let playbackContext = null;
         let nextPlaybackTime = 0;
         const activePlaybackSources = new Set();
+        // Adaptive jitter buffer: audio is scheduled `jitterLead` seconds ahead
+        // of "now" whenever playback (re)starts. Each mid-reply underrun means
+        // the network/TTS is burstier than the lead, so the lead grows.
+        const JITTER = { initial: 0.12, step: 0.08, max: 0.6, fadeSeconds: 0.004 };
+        let jitterLead = JITTER.initial;
+        let replyAudioStarted = false;
         let pendingTTSChunks = [];
         let currentAssistantMessageDiv = null;
         // True from end of user speech until the reply has finished playing.
@@ -371,6 +377,7 @@
                 }
                 appendUserMessage(msg.text);
                 prepareAssistantMessage();
+                replyAudioStarted = false;  // a new reply: first start is not an underrun
             } else if (msg.type === 'llm_chunk') {
                 appendAssistantChunk(msg.delta);
             } else if (msg.type === 'tts_chunk') {
@@ -456,33 +463,58 @@
             if (isRunning) updateStatus('Listening...', 'listening');
         }
 
-        // Playback using Web Audio API. Kept synchronous so chunks are always
-        // scheduled in arrival order.
-        function playTTSChunk(b64Audio, sampleRate, channels) {
-            ensurePlaybackContext();
-
+        // Decode base64 little-endian PCM16 into an AudioBuffer.
+        function decodePcm16(b64Audio, sampleRate, channels) {
             const binaryStr = atob(b64Audio);
-            const sampleCount = Math.floor(binaryStr.length / 2);
-            if (sampleCount === 0) return;
+            const bytes = new Uint8Array(binaryStr.length);
+            for (let i = 0; i < bytes.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+            const view = new DataView(bytes.buffer);
             const channelCount = Math.max(1, channels);
-            const frames = Math.floor(sampleCount / channelCount);
-            if (frames === 0) return;
+            const frames = Math.floor(bytes.length / 2 / channelCount);
+            if (frames === 0) return null;
 
             const audioBuffer = playbackContext.createBuffer(channelCount, frames, sampleRate);
             for (let channel = 0; channel < channelCount; channel++) {
                 const channelData = audioBuffer.getChannelData(channel);
                 for (let frame = 0; frame < frames; frame++) {
-                    const i = (frame * channelCount + channel) * 2;
-                    let v = binaryStr.charCodeAt(i) | (binaryStr.charCodeAt(i + 1) << 8);
-                    if (v >= 0x8000) v -= 0x10000;
-                    channelData[frame] = v / 32768.0;
+                    channelData[frame] = view.getInt16((frame * channelCount + channel) * 2, true) / 32768;
                 }
             }
+            return audioBuffer;
+        }
+
+        // Ramp the first few ms up from silence so playback that starts after
+        // a gap does not click.
+        function applyFadeIn(audioBuffer) {
+            const fadeFrames = Math.min(audioBuffer.length, Math.round(audioBuffer.sampleRate * JITTER.fadeSeconds));
+            for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
+                const data = audioBuffer.getChannelData(channel);
+                for (let i = 0; i < fadeFrames; i++) data[i] *= i / fadeFrames;
+            }
+        }
+
+        // Playback using Web Audio API. Kept synchronous so chunks are always
+        // scheduled in arrival order, back to back on the audio clock.
+        function playTTSChunk(b64Audio, sampleRate, channels) {
+            ensurePlaybackContext();
+            const audioBuffer = decodePcm16(b64Audio, sampleRate, channels);
+            if (!audioBuffer) return;
+
+            const now = playbackContext.currentTime;
+            let startAt = nextPlaybackTime;
+            if (startAt < now + 0.01) {
+                // Queue ran dry. Mid-reply in streaming mode this is an underrun:
+                // widen the buffer. (Smooth mode pauses between sentences by design.)
+                const streaming = document.getElementById('playbackMode').value !== 'smooth';
+                if (replyAudioStarted && streaming) jitterLead = Math.min(JITTER.max, jitterLead + JITTER.step);
+                startAt = now + jitterLead;
+                applyFadeIn(audioBuffer);
+            }
+            replyAudioStarted = true;
 
             const source = playbackContext.createBufferSource();
             source.buffer = audioBuffer;
             source.connect(playbackContext.destination);
-            const startAt = Math.max(playbackContext.currentTime + 0.05, nextPlaybackTime);
             source.start(startAt);
             nextPlaybackTime = startAt + audioBuffer.duration;
             activePlaybackSources.add(source);
@@ -505,6 +537,7 @@
             }
             activePlaybackSources.clear();
             nextPlaybackTime = playbackContext ? playbackContext.currentTime : 0;
+            replyAudioStarted = false;
         }
 
         // Streams the bundled real speech sample (voice-check.wav) as if spoken

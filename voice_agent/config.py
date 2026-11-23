@@ -127,18 +127,30 @@ class Settings(BaseSettings):
         default="bfloat16", description="Torch dtype for LLM weights"
     )
     llm_max_new_tokens: int = Field(
-        default=48, description="Max tokens to generate per turn"
+        default=128,
+        description=(
+            "Max tokens per reply. Indic scripts need ~3 tokens per word, so "
+            "values below ~100 cut replies off mid-sentence"
+        ),
     )
     llm_temperature: float = Field(
-        default=0.4, description="Generation temperature for concise voice responses"
+        default=0.5, description="Generation temperature for natural spoken replies"
+    )
+    conversation_max_turns: int = Field(
+        default=6,
+        ge=1,
+        description="User/assistant exchanges remembered per session and sent to the LLM",
     )
     system_prompt: str = Field(
         default=(
-            "You are a helpful, respectful multilingual Indian voice assistant. "
-            "Reply in the user's language using natural spoken language. "
-            "Keep answers short and conversational, usually one sentence. "
-            "For greetings, greet back and invite the user to continue. "
-            "If you lack live information, say so briefly instead of guessing."
+            "You are a warm, attentive multilingual Indian voice assistant having a "
+            "spoken conversation. Listen to exactly what the user said and respond "
+            "to that, using what they told you earlier in the conversation (their "
+            "name, plans, questions). Match their tone and formality. Answer in one "
+            "or two short spoken sentences; when it helps the conversation, end "
+            "with a brief follow-up question. Never use lists, markdown, emojis or "
+            "symbols, because your words are spoken aloud. If you do not know "
+            "something or lack live information, say so briefly instead of guessing."
         ),
         description="System prompt for the conversation",
     )
@@ -182,6 +194,19 @@ class Settings(BaseSettings):
         description=(
             "Audio the remote Svara server buffers before streaming starts "
             "(server default 500 ms). Lower = faster first audio."
+        ),
+    )
+    tts_min_frame_ms: int = Field(
+        default=160,
+        ge=20,
+        description="Smallest audio frame sent to the client; tiny TTS pieces are merged",
+    )
+    tts_max_chars_per_request: int = Field(
+        default=220,
+        ge=40,
+        description=(
+            "When the full reply is known before speaking (no LLM/TTS overlap), "
+            "sentences are merged into TTS requests up to this length"
         ),
     )
     svara_api_timeout_seconds: float = Field(
