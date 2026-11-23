@@ -3,13 +3,18 @@ name: Deploy (GCP)
 # Manual only: the GPU VM may be stopped, and a first deploy downloads ~25 GB.
 # Runs the full CI first, then deploy/gcp/deploy.sh against the existing VM.
 #
-# Repository settings needed (Settings > Secrets and variables > Actions):
-#   secret   GCP_SA_KEY      service-account JSON key. The account needs
-#                            Compute Instance Admin (v1) and Service Account User
-#                            to scp/ssh into the VM.
-#   variable GCP_PROJECT_ID  project that holds the VM
-#   variable GCP_ZONE        optional, defaults to asia-south1-a
-#   variable GCP_VM_NAME     optional, defaults to voice-agent-gpu
+# Auth is keyless (Workload Identity Federation): GitHub's OIDC token is
+# exchanged for short-lived credentials of GCP_SERVICE_ACCOUNT. The provider
+# only trusts this repository on refs/heads/main, so run it from main.
+#
+# Repository variables needed (Settings > Secrets and variables > Actions):
+#   GCP_PROJECT_ID       project that holds the VM
+#   GCP_WIF_PROVIDER     projects/<num>/locations/global/workloadIdentityPools/<pool>/providers/<id>
+#   GCP_SERVICE_ACCOUNT  deployer account: Compute Instance Admin (v1) on the VM,
+#                        Compute Viewer on the project, Service Account User on
+#                        the VM's service account
+#   GCP_ZONE             optional, defaults to asia-south1-a
+#   GCP_VM_NAME          optional, defaults to voice-agent-gpu
 on:
   workflow_dispatch:
 
@@ -30,6 +35,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write  # OIDC token for Workload Identity Federation
     env:
       ZONE: ${{ vars.GCP_ZONE || 'asia-south1-a' }}
       NAME: ${{ vars.GCP_VM_NAME || 'voice-agent-gpu' }}
@@ -40,7 +48,8 @@ jobs:
 
       - uses: google-github-actions/auth@v3
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - uses: google-github-actions/setup-gcloud@v3
 
