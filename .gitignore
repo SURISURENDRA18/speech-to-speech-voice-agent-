@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets & local config
+.env
+deploy/gcp/.env
+
+# Upstream clones / archives pulled in during setup
+deploy/gcp/svara-tts-inference/
+*.zip
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

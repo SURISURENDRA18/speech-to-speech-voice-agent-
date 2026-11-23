@@ -1,0 +1,130 @@
+# One NVIDIA L4 (24 GB) runs everything:
+#   svara  - Svara TTS (vLLM, embedded)      ~45% of GPU memory
+#   qwen   - Qwen3-1.7B (vLLM OpenAI server) ~25% of GPU memory
+#   agent  - VAD + Whisper turbo + WebSocket ~2.5 GB
+#   caddy  - HTTPS (browsers only allow the microphone on https://)
+# Services start in that order because vLLM checks free GPU memory at startup.
+
+services:
+  svara:
+    build:
+      context: ./svara-tts-inference
+      dockerfile: ../svara.Dockerfile
+      args:
+        VLLM_IMAGE: "${VLLM_IMAGE:-vllm/vllm-openai:v0.34.0}"
+    image: svara-tts-api:local
+    environment:
+      VLLM_MODEL: kenpath/svara-tts-v1
+      VLLM_GPU_MEMORY_UTILIZATION: "${SVARA_GPU_MEMORY_UTILIZATION:-0.45}"
+      VLLM_MAX_MODEL_LEN: "2048"
+      # L4 decoding is memory-bandwidth bound: FP8 halves the 6.2 GB of
+      # weights read per audio token, roughly doubling Svara's speed.
+      VLLM_QUANTIZATION: "${SVARA_QUANTIZATION:-fp8}"
+      SNAC_DEVICE: cuda
+      HF_TOKEN: "${HF_TOKEN:-}"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 60
+      start_period: 180s
+    restart: unless-stopped
+
+  qwen:
+    image: "${VLLM_IMAGE:-vllm/vllm-openai:v0.34.0}"
+    entrypoint: ["vllm", "serve"]
+    command:
+      - Qwen/Qwen3-1.7B
+      - --served-model-name
+      - Qwen/Qwen3-1.7B
+      - --port
+      - "8001"
+      - --gpu-memory-utilization
+      - "${QWEN_GPU_MEMORY_UTILIZATION:-0.25}"
+      - --max-model-len
+      - "4096"
+      # FP8 halves the weights read per token on the bandwidth-bound L4, so
+      # Qwen finishes sooner and competes less with Svara for the GPU.
+      - --quantization
+      - "${QWEN_QUANTIZATION:-fp8}"
+    environment:
+      HF_TOKEN: "${HF_TOKEN:-}"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      svara:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 60
+      start_period: 180s
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: ../..
+      dockerfile: deploy/gcp/Dockerfile
+    image: voice-agent:local
+    environment:
+      USE_MLX: "false"
+      WHISPER_DEVICE: cuda
+      WHISPER_LANGUAGE: "${WHISPER_LANGUAGE:-hi}"
+      LLM_API_URL: http://qwen:8001
+      LLM_API_MODEL: Qwen/Qwen3-1.7B
+      SVARA_API_URL: http://svara:8080
+      CLIENT_PLAYBACK_MODE: "${CLIENT_PLAYBACK_MODE:-fast}"
+      SVARA_BUFFER_MS: "${SVARA_BUFFER_MS:-120}"
+      LLM_MAX_NEW_TOKENS: "${LLM_MAX_NEW_TOKENS:-96}"
+      OVERLAP_LLM_TTS: "${OVERLAP_LLM_TTS:-true}"
+      VAD_MIN_SILENCE_DURATION_MS: "${VAD_MIN_SILENCE_DURATION_MS:-300}"
+      LOG_LEVEL: INFO
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      qwen:
+        condition: service_healthy
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_ADDRESS: "${SITE_ADDRESS:?set SITE_ADDRESS in deploy/gcp/.env}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - agent
+    restart: unless-stopped
+
+volumes:
+  hf_cache:
+  caddy_data:

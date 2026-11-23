@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speech-to-Speech Voice Agent - Web Client</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --surface: #1e293b;
+            --surface-hover: #334155;
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --accent: #10b981;
+            --danger: #ef4444;
+            --text: #f8fafc;
+            --text-muted: #94a3b8;
+            --border: #334155;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+        body { background: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; }
+        header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
+        .logo { font-size: 1.25rem; font-weight: 700; display: flex; align-items: center; gap: 0.5rem; }
+        .logo span { color: var(--primary); }
+        .badge { font-size: 0.75rem; padding: 0.25rem 0.6rem; border-radius: 9999px; background: var(--surface-hover); border: 1px solid var(--border); color: var(--text-muted); }
+        .badge.connected { background: rgba(16, 185, 129, 0.15); border-color: var(--accent); color: var(--accent); }
+        .badge.listening { background: rgba(59, 130, 246, 0.15); border-color: var(--primary); color: var(--primary); }
+        .badge.speaking { background: rgba(245, 158, 11, 0.15); border-color: #f59e0b; color: #f59e0b; }
+        .badge.interrupted { background: rgba(239, 68, 68, 0.15); border-color: var(--danger); color: var(--danger); }
+
+        main { flex: 1; max-width: 900px; width: 100%; margin: 0 auto; padding: 1.5rem; display: flex; flex-direction: column; gap: 1.5rem; }
+        .controls-card { background: var(--surface); border: 1px solid var(--border); border-radius: 0.75rem; padding: 1.25rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; align-items: center; }
+        .control-group { display: flex; flex-direction: column; gap: 0.4rem; }
+        label { font-size: 0.8rem; color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+        select, button { padding: 0.6rem 0.9rem; border-radius: 0.5rem; border: 1px solid var(--border); background: var(--surface-hover); color: var(--text); font-size: 0.9rem; outline: none; cursor: pointer; transition: all 0.15s ease; }
+        select:focus { border-color: var(--primary); }
+        button.btn-primary { background: var(--primary); border-color: var(--primary); color: white; font-weight: 600; }
+        button.btn-primary:hover { background: var(--primary-hover); }
+        button.btn-danger { background: rgba(239, 68, 68, 0.2); border-color: var(--danger); color: var(--danger); }
+        button.btn-danger:hover { background: var(--danger); color: white; }
+
+        .visualizer-card { background: var(--surface); border: 1px solid var(--border); border-radius: 0.75rem; padding: 1.25rem; display: flex; flex-direction: column; align-items: center; gap: 1rem; }
+        .status-indicator { font-size: 1.1rem; font-weight: 600; display: flex; align-items: center; gap: 0.5rem; }
+        .pulse-dot { width: 12px; height: 12px; border-radius: 50%; background: #64748b; }
+        .pulse-dot.active { background: var(--accent); box-shadow: 0 0 12px var(--accent); animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.3); opacity: 0.7; } 100% { transform: scale(1); opacity: 1; } }
+
+        .chat-container { flex: 1; background: var(--surface); border: 1px solid var(--border); border-radius: 0.75rem; padding: 1.25rem; overflow-y: auto; display: flex; flex-direction: column; gap: 1rem; min-height: 350px; max-height: 500px; }
+        .message { display: flex; flex-direction: column; gap: 0.25rem; max-width: 80%; padding: 0.75rem 1rem; border-radius: 0.75rem; font-size: 0.95rem; line-height: 1.5; }
+        .message.user { align-self: flex-end; background: var(--primary); color: white; border-bottom-right-radius: 0.2rem; }
+        .message.assistant { align-self: flex-start; background: var(--surface-hover); border: 1px solid var(--border); border-bottom-left-radius: 0.2rem; }
+        .message .sender { font-size: 0.75rem; font-weight: 600; color: rgba(255, 255, 255, 0.7); margin-bottom: 0.2rem; }
+        .message.assistant .sender { color: var(--text-muted); }
+        .streaming-cursor { display: inline-block; width: 6px; height: 15px; background: var(--primary); margin-left: 2px; vertical-align: middle; animation: blink 0.8s infinite; }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+        .log-bar { font-size: 0.8rem; color: var(--text-muted); background: rgba(0,0,0,0.2); padding: 0.5rem 1rem; border-radius: 0.5rem; display: flex; justify-content: space-between; font-family: monospace; }
+        .actions-row { display: flex; gap: 0.75rem; width: 100%; justify-content: center; }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="logo">
+            <span>⚡ Antigravity</span> Speech-to-Speech Voice Agent
+        </div>
+        <div id="statusBadge" class="badge">Disconnected</div>
+    </header>
+
+    <main>
+        <div class="controls-card">
+            <div class="control-group">
+                <label>Language</label>
+                <select id="langSelect">
+                    <option value="hi" selected>Hindi (हिन्दी)</option>
+                    <option value="en">Indian English</option>
+                    <option value="bn">Bengali (বাংলা)</option>
+                    <option value="mr">Marathi (मराठी)</option>
+                    <option value="te">Telugu (తెలుగు)</option>
+                    <option value="ta">Tamil (தமிழ்)</option>
+                    <option value="gu">Gujarati (ગુજરાતી)</option>
+                    <option value="kn">Kannada (ಕನ್ನಡ)</option>
+                    <option value="ml">Malayalam (മലയാളം)</option>
+                    <option value="pa">Punjabi (ਪੰਜਾਬੀ)</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Voice</label>
+                <select id="voiceSelect">
+                    <option value="hi_female" selected>Hindi Female</option>
+                    <option value="hi_male">Hindi Male</option>
+                    <option value="en_female">English Female</option>
+                    <option value="en_male">English Male</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>VAD Sensitivity</label>
+                <select id="vadThreshold">
+                    <option value="0.3">High (0.3)</option>
+                    <option value="0.5" selected>Standard (0.5)</option>
+                    <option value="0.7">Low (0.7)</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Playback</label>
+                <select id="playbackMode">
+                    <option value="smooth" selected>Smooth (play each full sentence)</option>
+                    <option value="fast">Fast start (may stutter)</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="visualizer-card">
+            <div class="status-indicator">
+                <div id="pulseDot" class="pulse-dot"></div>
+                <span id="sessionStatus">Ready to connect</span>
+            </div>
+            <div class="actions-row">
+                <button id="toggleBtn" class="btn-primary" onclick="toggleSession()">🎙️ Connect & Start Microphone</button>
+                <button id="testAudioBtn" onclick="sendTestAudio()">🔊 Send Sample Audio Turn</button>
+                <button id="interruptBtn" class="btn-danger" onclick="triggerInterrupt()" disabled>✋ Barge-In / Interrupt</button>
+            </div>
+        </div>
+
+        <div class="chat-container" id="chatContainer">
+            <div class="message assistant">
+                <div class="sender">Assistant</div>
+                <div>नमस्ते! मैं आपका स्थानीय Speech-to-Speech AI सहायक हूँ। बात शुरू करने के लिए ऊपर दिए गए बटन पर क्लिक करें।</div>
+            </div>
+        </div>
+
+        <div class="log-bar">
+            <span id="logEvent">Status: Initialized</span>
+            <span id="latencySpan">Latencies: TTFT: -- | TTFA: --</span>
+        </div>
+    </main>
+
+    <script>
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        const TARGET_MIC_RATE = 16000;
+
+        let ws = null;
+        let isRunning = false;
+        let audioContext = null;
+        let mediaStream = null;
+        let scriptProcessor = null;
+        let micSampleRate = TARGET_MIC_RATE;
+        let playbackContext = null;
+        let nextPlaybackTime = 0;
+        const activePlaybackSources = new Set();
+        let pendingTTSChunks = [];
+        let currentAssistantMessageDiv = null;
+        // True from end of user speech until the reply has finished playing.
+        // The mic is not streamed during that window so room noise or speaker
+        // echo cannot cancel the turn or cut off the assistant's audio.
+        let assistantBusy = false;
+        let sendingSample = false;
+        let resumeTimer = null;
+        let sessionReady = null;
+
+        // Server recommends "fast" playback when TTS runs on a GPU (faster
+        // than real time) and "smooth" for slow local synthesis.
+        fetch('/v1/client-config')
+            .then(res => res.json())
+            .then(cfg => {
+                if (cfg && cfg.playback_mode) {
+                    document.getElementById('playbackMode').value = cfg.playback_mode;
+                }
+            })
+            .catch(() => {});
+
+        // Initialize voice dropdown from API
+        fetch('/v1/voices')
+            .then(res => res.json())
+            .then(data => {
+                if (data && data.voices && data.voices.length > 0) {
+                    const select = document.getElementById('voiceSelect');
+                    select.innerHTML = '';
+                    data.voices.forEach(v => {
+                        const opt = document.createElement('option');
+                        opt.value = v.voice_id;
+                        opt.textContent = v.name;
+                        if (v.voice_id === 'hi_female') opt.selected = true;
+                        select.appendChild(opt);
+                    });
+                }
+            })
+            .catch(() => {});
+
+        function logEvent(text) {
+            document.getElementById('logEvent').textContent = text;
+        }
+
+        function updateStatus(text, badgeClass) {
+            document.getElementById('sessionStatus').textContent = text;
+            const badge = document.getElementById('statusBadge');
+            badge.textContent = text;
+            badge.className = 'badge ' + (badgeClass || '');
+            const dot = document.getElementById('pulseDot');
+            dot.className = 'pulse-dot ' + (badgeClass === 'listening' || badgeClass === 'speaking' ? 'active' : '');
+        }
+
+        function ensurePlaybackContext() {
+            // Must first run inside a click handler so autoplay policy allows sound.
+            if (!playbackContext || playbackContext.state === 'closed') {
+                playbackContext = new AudioCtx({ sampleRate: 24000 });
+                nextPlaybackTime = 0;
+            }
+            if (playbackContext.state === 'suspended') playbackContext.resume();
+        }
+
+        async function toggleSession() {
+            if (isRunning) {
+                stopSession();
+            } else {
+                startSession();
+            }
+        }
+
+        function startSession() {
+            ensurePlaybackContext();
+            if (sessionReady) return sessionReady;
+
+            sessionReady = new Promise((resolve, reject) => {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                ws = new WebSocket(`${protocol}//${window.location.host}/ws/voice`);
+
+                ws.onopen = async () => {
+                    updateStatus('Connected', 'connected');
+                    await initMicrophone();
+
+                    ws.send(JSON.stringify({
+                        type: 'start',
+                        config: {
+                            sample_rate: micSampleRate,
+                            language: document.getElementById('langSelect').value,
+                            voice: document.getElementById('voiceSelect').value,
+                            vad_threshold: parseFloat(document.getElementById('vadThreshold').value),
+                            min_silence_duration_ms: 300
+                        }
+                    }));
+
+                    isRunning = true;
+                    assistantBusy = false;
+                    document.getElementById('toggleBtn').textContent = '⏹️ Stop Voice Session';
+                    document.getElementById('interruptBtn').disabled = false;
+                    updateStatus('Listening...', 'listening');
+                    resolve();
+                };
+
+                ws.onmessage = (event) => handleServerMessage(JSON.parse(event.data));
+
+                ws.onclose = () => {
+                    stopSession();
+                    updateStatus('Disconnected', '');
+                    reject(new Error('closed'));
+                };
+
+                ws.onerror = (err) => {
+                    console.error('WebSocket error:', err);
+                    logEvent('Error: could not connect to the voice server');
+                };
+            });
+            sessionReady.catch(() => {});
+            return sessionReady;
+        }
+
+        function stopSession() {
+            isRunning = false;
+            assistantBusy = false;
+            sessionReady = null;
+            clearTimeout(resumeTimer);
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'stop' }));
+                ws.close();
+            }
+            if (scriptProcessor) scriptProcessor.disconnect();
+            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+            if (audioContext && audioContext.state !== 'closed') audioContext.close();
+            scriptProcessor = null;
+            mediaStream = null;
+            audioContext = null;
+            stopPlayback();
+
+            document.getElementById('toggleBtn').textContent = '🎙️ Connect & Start Microphone';
+            document.getElementById('interruptBtn').disabled = true;
+            updateStatus('Ready to connect', '');
+        }
+
+        async function initMicrophone() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+
+                let source;
+                try {
+                    audioContext = new AudioCtx({ sampleRate: TARGET_MIC_RATE });
+                    source = audioContext.createMediaStreamSource(mediaStream);
+                } catch (rateErr) {
+                    // Some browsers (e.g. Firefox) refuse a mic source whose rate
+                    // differs from the device; use the native rate and let the
+                    // server resample using the rate sent in the start config.
+                    if (audioContext) audioContext.close();
+                    audioContext = new AudioCtx();
+                    source = audioContext.createMediaStreamSource(mediaStream);
+                }
+                if (audioContext.state === 'suspended') await audioContext.resume();
+                micSampleRate = audioContext.sampleRate;
+
+                scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+                source.connect(scriptProcessor);
+                scriptProcessor.connect(audioContext.destination);
+
+                scriptProcessor.onaudioprocess = (e) => {
+                    if (!isRunning || assistantBusy || sendingSample) return;
+                    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                    ws.send(floatToPcm16(e.inputBuffer.getChannelData(0)).buffer);
+                };
+                logEvent(`Microphone ready (${micSampleRate} Hz)`);
+            } catch (err) {
+                console.warn('Microphone access unavailable or denied:', err);
+                micSampleRate = TARGET_MIC_RATE;
+                logEvent('Notice: Microphone access not granted. Use "Send Sample Audio Turn" to test!');
+            }
+        }
+
+        function floatToPcm16(float32Data) {
+            const pcm16 = new Int16Array(float32Data.length);
+            for (let i = 0; i < float32Data.length; i++) {
+                const s = Math.max(-1, Math.min(1, float32Data[i]));
+                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            return pcm16;
+        }
+
+        function setBusy() {
+            assistantBusy = true;
+            clearTimeout(resumeTimer);
+        }
+
+        // Re-open the mic only after queued assistant audio has finished playing.
+        function resumeListeningAfterPlayback() {
+            clearTimeout(resumeTimer);
+            const remaining = playbackContext
+                ? Math.max(0, nextPlaybackTime - playbackContext.currentTime)
+                : 0;
+            resumeTimer = setTimeout(() => {
+                assistantBusy = false;
+                if (isRunning) updateStatus('Listening...', 'listening');
+            }, remaining * 1000 + 300);
+        }
+
+        function handleServerMessage(msg) {
+            if (msg.type !== 'tts_chunk' && msg.type !== 'llm_chunk') logEvent(`Event: ${msg.type}`);
+
+            if (msg.type === 'vad_speech_start') {
+                updateStatus('User Speaking (VAD Active)', 'listening');
+            } else if (msg.type === 'vad_speech_end') {
+                setBusy();
+                updateStatus('Thinking...', 'speaking');
+            } else if (msg.type === 'transcript') {
+                if (!msg.text || !msg.text.trim()) {
+                    logEvent('No speech recognized — please try again');
+                    resumeListeningAfterPlayback();
+                    return;
+                }
+                appendUserMessage(msg.text);
+                prepareAssistantMessage();
+            } else if (msg.type === 'llm_chunk') {
+                appendAssistantChunk(msg.delta);
+            } else if (msg.type === 'tts_chunk') {
+                // Local Svara generates slower than real time on base Macs, so
+                // "smooth" buffers each sentence and plays it without gaps.
+                const smooth = document.getElementById('playbackMode').value === 'smooth';
+                if (smooth) {
+                    pendingTTSChunks.push(msg);
+                    if (msg.is_last) {
+                        flushPendingTTS();
+                    } else if (activePlaybackSources.size === 0) {
+                        updateStatus('Generating voice...', 'speaking');
+                    }
+                } else {
+                    updateStatus('Speaking...', 'speaking');
+                    playTTSChunk(msg.audio, msg.sample_rate || 24000, msg.channels || 1);
+                }
+            } else if (msg.type === 'interrupted') {
+                updateStatus('Interrupted / Barge-In!', 'interrupted');
+                stopPlayback();
+                finishAssistantMessage();
+                assistantBusy = false;
+                setTimeout(() => { if (isRunning && !assistantBusy) updateStatus('Listening...', 'listening'); }, 1000);
+            } else if (msg.type === 'turn_complete') {
+                flushPendingTTS();
+                finishAssistantMessage();
+                resumeListeningAfterPlayback();
+            } else if (msg.type === 'error') {
+                console.error('Server error:', msg);
+                logEvent(`Error (${msg.code}): ${msg.message}`);
+                flushPendingTTS();
+                finishAssistantMessage();
+                resumeListeningAfterPlayback();
+            }
+        }
+
+        function appendUserMessage(text) {
+            const container = document.getElementById('chatContainer');
+            const msgDiv = document.createElement('div');
+            msgDiv.className = 'message user';
+            msgDiv.innerHTML = `<div class="sender">User</div><div class="content"></div>`;
+            msgDiv.querySelector('.content').textContent = text;
+            container.appendChild(msgDiv);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function prepareAssistantMessage() {
+            const container = document.getElementById('chatContainer');
+            const msgDiv = document.createElement('div');
+            msgDiv.className = 'message assistant';
+            msgDiv.innerHTML = `<div class="sender">Assistant</div><div class="content"></div><span class="streaming-cursor"></span>`;
+            container.appendChild(msgDiv);
+            currentAssistantMessageDiv = msgDiv;
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function appendAssistantChunk(delta) {
+            if (currentAssistantMessageDiv) {
+                const content = currentAssistantMessageDiv.querySelector('.content');
+                content.textContent += delta;
+                const container = document.getElementById('chatContainer');
+                container.scrollTop = container.scrollHeight;
+            }
+        }
+
+        function finishAssistantMessage() {
+            if (currentAssistantMessageDiv) {
+                const cursor = currentAssistantMessageDiv.querySelector('.streaming-cursor');
+                if (cursor) cursor.remove();
+                currentAssistantMessageDiv = null;
+            }
+        }
+
+        function triggerInterrupt() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'interrupt' }));
+            }
+            // Stop local audio right away even if the server already finished sending.
+            stopPlayback();
+            finishAssistantMessage();
+            clearTimeout(resumeTimer);
+            assistantBusy = false;
+            if (isRunning) updateStatus('Listening...', 'listening');
+        }
+
+        // Playback using Web Audio API. Kept synchronous so chunks are always
+        // scheduled in arrival order.
+        function playTTSChunk(b64Audio, sampleRate, channels) {
+            ensurePlaybackContext();
+
+            const binaryStr = atob(b64Audio);
+            const sampleCount = Math.floor(binaryStr.length / 2);
+            if (sampleCount === 0) return;
+            const channelCount = Math.max(1, channels);
+            const frames = Math.floor(sampleCount / channelCount);
+            if (frames === 0) return;
+
+            const audioBuffer = playbackContext.createBuffer(channelCount, frames, sampleRate);
+            for (let channel = 0; channel < channelCount; channel++) {
+                const channelData = audioBuffer.getChannelData(channel);
+                for (let frame = 0; frame < frames; frame++) {
+                    const i = (frame * channelCount + channel) * 2;
+                    let v = binaryStr.charCodeAt(i) | (binaryStr.charCodeAt(i + 1) << 8);
+                    if (v >= 0x8000) v -= 0x10000;
+                    channelData[frame] = v / 32768.0;
+                }
+            }
+
+            const source = playbackContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(playbackContext.destination);
+            const startAt = Math.max(playbackContext.currentTime + 0.05, nextPlaybackTime);
+            source.start(startAt);
+            nextPlaybackTime = startAt + audioBuffer.duration;
+            activePlaybackSources.add(source);
+            source.onended = () => activePlaybackSources.delete(source);
+        }
+
+        function flushPendingTTS() {
+            if (pendingTTSChunks.length === 0) return;
+            updateStatus('Speaking...', 'speaking');
+            for (const chunk of pendingTTSChunks) {
+                playTTSChunk(chunk.audio, chunk.sample_rate || 24000, chunk.channels || 1);
+            }
+            pendingTTSChunks = [];
+        }
+
+        function stopPlayback() {
+            pendingTTSChunks = [];
+            for (const source of activePlaybackSources) {
+                try { source.stop(); } catch (_) {}
+            }
+            activePlaybackSources.clear();
+            nextPlaybackTime = playbackContext ? playbackContext.currentTime : 0;
+        }
+
+        // Streams the bundled real speech sample (voice-check.wav) as if spoken
+        // into the mic, so the full STT -> LLM -> TTS loop can be tested.
+        async function sendTestAudio() {
+            ensurePlaybackContext();
+            if (assistantBusy) {
+                logEvent('Assistant is still replying — wait for it to finish');
+                return;
+            }
+            try {
+                await startSession();
+            } catch (_) {
+                return;
+            }
+
+            sendingSample = true;
+            try {
+                const res = await fetch('/static/voice-check.wav');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const wavBytes = await res.arrayBuffer();
+                // Decoding through a context at micSampleRate resamples for us.
+                const decoder = new OfflineAudioContext(1, 1, micSampleRate);
+                const decoded = await decoder.decodeAudioData(wavBytes);
+                const speech = decoded.getChannelData(0);
+
+                const lead = new Float32Array(Math.round(micSampleRate * 0.5));
+                const tail = new Float32Array(Math.round(micSampleRate * 1.0));
+                const all = new Float32Array(lead.length + speech.length + tail.length);
+                all.set(lead, 0);
+                all.set(speech, lead.length);
+                all.set(tail, lead.length + speech.length);
+
+                updateStatus('Sending sample speech...', 'listening');
+                const chunk = 4096;
+                for (let i = 0; i < all.length; i += chunk) {
+                    if (!ws || ws.readyState !== WebSocket.OPEN) break;
+                    ws.send(floatToPcm16(all.subarray(i, i + chunk)).buffer);
+                    await new Promise(r => setTimeout(r, 20));
+                }
+                logEvent('Sample speech sent — waiting for reply');
+            } catch (err) {
+                console.error('Sample audio failed:', err);
+                logEvent(`Error: could not send sample audio (${err.message})`);
+            } finally {
+                sendingSample = false;
+            }
+        }
+    </script>
+</body>
+</html>

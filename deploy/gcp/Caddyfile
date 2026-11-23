@@ -1,0 +1,7 @@
+# Automatic HTTPS (Let's Encrypt) in front of the voice agent. WebSockets
+# (/ws/voice) are proxied transparently.
+{$SITE_ADDRESS} {
+	reverse_proxy agent:8000 {
+		flush_interval -1
+	}
+}
