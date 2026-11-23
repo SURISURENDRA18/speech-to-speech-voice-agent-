@@ -10,6 +10,7 @@ import pytest
 from voice_agent.llm.base import LLMBase
 from voice_agent.llm.mock_llm import MockLLMAdapter
 from voice_agent.normalization.indic_norm import IndicTextNormalizer
+from voice_agent.pipeline.conversation import ConversationMemory
 from voice_agent.pipeline.session import SessionState, VoiceSession
 from voice_agent.server.protocol import SessionStartConfig
 from voice_agent.stt.mock_stt import MockSTTAdapter
@@ -206,6 +207,21 @@ async def test_tiny_tts_pieces_are_coalesced_into_larger_frames():
     assert len(frames) <= 3  # instead of 41 tiny messages
     assert frames[-1]["is_last"] is True
     await session.stop()
+
+
+def test_injected_empty_memory_is_used_not_replaced():
+    memory = ConversationMemory(max_turns=2)
+    session = VoiceSession(
+        session_id="mem",
+        vad=ScriptedVAD(),
+        stt=MockSTTAdapter(),
+        llm=MockLLMAdapter(),
+        normalizer=IndicTextNormalizer(default_lang="hi", use_wfst=False),
+        tts=MockTTSAdapter(),
+        send_callback=lambda _event: asyncio.sleep(0),
+        memory=memory,
+    )
+    assert session.memory is memory
 
 
 @pytest.mark.asyncio

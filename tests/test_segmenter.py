@@ -55,6 +55,15 @@ def test_clean_for_speech_strips_markdown_emojis_and_think_tags():
     assert clean_for_speech("COVID-19 के बारे में") == "COVID-19 के बारे में"
 
 
+def test_clean_for_speech_keeps_zero_width_joiner_inside_indic_words():
+    malayalam = "അവന്‍ വന്നു"  # ZWJ forms the chillu letter
+    bengali = "র‍্যাব"  # ZWJ forms the ya-phala
+    assert clean_for_speech(malayalam) == malayalam
+    assert clean_for_speech(bengali) == bengali
+    # A ZWJ emoji sequence is still removed entirely.
+    assert clean_for_speech("ठीक 👨‍👩‍👧 है") == "ठीक है"
+
+
 def test_ends_with_terminator():
     assert ends_with_terminator("ठीक है।")
     assert ends_with_terminator('He said "yes."')

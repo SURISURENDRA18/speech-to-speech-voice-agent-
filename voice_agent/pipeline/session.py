@@ -101,7 +101,12 @@ class VoiceSession:
 
         self.state = SessionState.IDLE
         self.config = SessionStartConfig()
-        self.memory = memory or ConversationMemory(max_turns=settings.conversation_max_turns)
+        # `is not None`: an empty ConversationMemory is falsy (it defines __len__).
+        self.memory = (
+            memory
+            if memory is not None
+            else ConversationMemory(max_turns=settings.conversation_max_turns)
+        )
 
         self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=settings.input_queue_maxsize

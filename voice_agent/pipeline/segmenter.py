@@ -27,8 +27,11 @@ _EMOJI = re.compile(
     "["
     "\U0001f000-\U0001faff"  # pictographs, emoticons, symbols & pictographs
     "\U00002600-\U000027bf"  # misc symbols, dingbats
-    "\U0000fe0f\U0000200d"  # variation selector, zero-width joiner
+    "\U0000fe0f"  # emoji variation selector
     "]+"
+    # Zero-width joiner only when it glues emoji together; inside Malayalam,
+    # Bengali or Devanagari words it selects a letter form and must be kept.
+    "|(?<=[\U0001f000-\U0001faff])\U0000200d"
 )
 _WHITESPACE = re.compile(r"\s+")
 
