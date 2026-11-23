@@ -1,0 +1,62 @@
+name: Deploy (GCP)
+
+# Manual only: the GPU VM may be stopped, and a first deploy downloads ~25 GB.
+# Runs the full CI first, then deploy/gcp/deploy.sh against the existing VM.
+#
+# Repository settings needed (Settings > Secrets and variables > Actions):
+#   secret   GCP_SA_KEY      service-account JSON key. The account needs
+#                            Compute Instance Admin (v1) and Service Account User
+#                            to scp/ssh into the VM.
+#   variable GCP_PROJECT_ID  project that holds the VM
+#   variable GCP_ZONE        optional, defaults to asia-south1-a
+#   variable GCP_VM_NAME     optional, defaults to voice-agent-gpu
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Deploy to GCP VM
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 60
+    env:
+      ZONE: ${{ vars.GCP_ZONE || 'asia-south1-a' }}
+      NAME: ${{ vars.GCP_VM_NAME || 'voice-agent-gpu' }}
+      CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+      CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Prepare SSH key for gcloud
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keygen -t rsa -b 4096 -N "" -q -f ~/.ssh/google_compute_engine
+
+      - name: Check the VM is running
+        run: |
+          status="$(gcloud compute instances describe "$NAME" --zone "$ZONE" --format='value(status)')"
+          echo "VM $NAME is $status"
+          if [ "$status" != "RUNNING" ]; then
+            echo "::error::Start the VM first: gcloud compute instances start $NAME --zone $ZONE"
+            exit 1
+          fi
+
+      - name: Deploy
+        run: bash deploy/gcp/deploy.sh
