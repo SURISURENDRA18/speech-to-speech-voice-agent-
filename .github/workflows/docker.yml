@@ -1,0 +1,53 @@
+name: Docker build
+
+# Checks that the GPU agent image still builds. Nothing is pushed.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "main.py"
+      - "voice_agent/**"
+      - "deploy/gcp/Dockerfile"
+      - "deploy/gcp/requirements-gpu.txt"
+      - ".dockerignore"
+      - ".github/workflows/docker.yml"
+  pull_request:
+    paths:
+      - "main.py"
+      - "voice_agent/**"
+      - "deploy/gcp/Dockerfile"
+      - "deploy/gcp/requirements-gpu.txt"
+      - ".dockerignore"
+      - ".github/workflows/docker.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build agent image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Free disk space
+        # torch + CUDA wheels make the image several GB; the runner needs the room.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/gcp/Dockerfile
+          push: false
+          tags: voice-agent:ci

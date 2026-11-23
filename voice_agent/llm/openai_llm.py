@@ -12,8 +12,7 @@ from typing import Any
 
 import httpx
 
-from voice_agent.config import settings
-from voice_agent.llm.base import LLMBase
+from voice_agent.llm.base import LLMBase, build_chat_messages
 
 logger = logging.getLogger(__name__)
 
@@ -52,21 +51,6 @@ class OpenAICompatibleLLMAdapter(LLMBase):
             )
         return self._client
 
-    def _messages(
-        self,
-        prompt: str,
-        history: list[dict[str, str]] | None,
-        system_prompt: str | None,
-    ) -> list[dict[str, str]]:
-        messages: list[dict[str, str]] = []
-        sys_p = system_prompt or settings.system_prompt
-        if sys_p:
-            messages.append({"role": "system", "content": sys_p})
-        if history:
-            messages.extend(history[-4:])
-        messages.append({"role": "user", "content": prompt})
-        return messages
-
     async def preload(self) -> None:
         """Open the connection and warm the server's kernels/prefix cache."""
         async for _ in self.generate_stream("नमस्ते"):
@@ -80,7 +64,7 @@ class OpenAICompatibleLLMAdapter(LLMBase):
     ) -> AsyncGenerator[str, None]:
         payload: dict[str, Any] = {
             "model": self._model,
-            "messages": self._messages(prompt, history, system_prompt),
+            "messages": build_chat_messages(prompt, history, system_prompt),
             "max_tokens": self._max_new_tokens,
             "temperature": self._temperature,
             "top_p": 0.9,

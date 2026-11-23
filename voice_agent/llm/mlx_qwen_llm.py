@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from voice_agent.config import settings
-from voice_agent.llm.base import LLMBase
+from voice_agent.llm.base import LLMBase, build_chat_messages
 
 logger = logging.getLogger(__name__)
 
@@ -81,15 +81,8 @@ class MLXQwen3LLMAdapter(LLMBase):
         history: list[dict[str, str]] | None,
         system_prompt: str | None,
     ) -> str:
-        messages: list[dict[str, str]] = []
-        sys_p = system_prompt or settings.system_prompt
-        if sys_p:
-            messages.append({"role": "system", "content": sys_p})
-        if history:
-            messages.extend(history[-4:])
-        messages.append({"role": "user", "content": prompt})
         return self._tokenizer.apply_chat_template(
-            messages,
+            build_chat_messages(prompt, history, system_prompt),
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,

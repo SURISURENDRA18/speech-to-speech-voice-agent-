@@ -3,6 +3,28 @@
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 
+from voice_agent.config import settings
+
+
+def build_chat_messages(
+    prompt: str,
+    history: list[dict[str, str]] | None,
+    system_prompt: str | None,
+) -> list[dict[str, str]]:
+    """Assemble ``[system, *history, user]`` chat messages for any adapter.
+
+    History length is owned by the caller (``ConversationMemory``); adapters
+    must not truncate it again.
+    """
+    messages: list[dict[str, str]] = []
+    sys_p = system_prompt or settings.system_prompt
+    if sys_p:
+        messages.append({"role": "system", "content": sys_p})
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
 
 class LLMBase(ABC):
     """Abstract base class for streaming LLM engines."""

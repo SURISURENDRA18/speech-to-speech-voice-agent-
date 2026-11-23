@@ -1,4 +1,18 @@
-"""Voice session state machine and speech-to-speech turn coordinator."""
+"""Voice session state machine and speech-to-speech turn coordinator.
+
+One ``VoiceSession`` exists per WebSocket connection. It owns that
+connection's VAD state, conversation memory and in-flight turn task. Model
+adapters (STT/LLM/TTS/normalizer) are shared, stateless-per-call services.
+
+Turn flow::
+
+    VAD speech_end -> _run_turn
+        _transcribe        STT -> "transcript" event
+        _generate_and_speak
+            LLM tokens -> "llm_chunk" events -> SentenceSegmenter
+            sentences -> _speak -> normalizer -> TTS -> PCM16Coalescer -> "tts_chunk"
+        ConversationMemory.record_turn (only what was actually spoken)
+"""
 
 import asyncio
 import contextlib
@@ -10,7 +24,7 @@ from typing import Any
 import numpy as np
 
 from voice_agent.audio import (
-    BoundedAudioAccumulator,
+    PCM16Coalescer,
     pcm16_to_float32,
     pcm_bytes_to_base64,
     resample_audio,
@@ -19,6 +33,12 @@ from voice_agent.audio import (
 from voice_agent.config import settings
 from voice_agent.llm.base import LLMBase
 from voice_agent.normalization.indic_norm import IndicTextNormalizer
+from voice_agent.pipeline.conversation import ConversationMemory, build_system_prompt
+from voice_agent.pipeline.segmenter import (
+    SentenceSegmenter,
+    ends_with_terminator,
+    group_for_synthesis,
+)
 from voice_agent.protocol import (
     ServerErrorMessage,
     ServerInterruptedMessage,
@@ -32,9 +52,14 @@ from voice_agent.protocol import (
 )
 from voice_agent.stt.base import STTBase
 from voice_agent.tts.base import TTSBase
-from voice_agent.vad.detector import SileroVADDetector
+from voice_agent.vad.detector import SileroVADDetector, VADEvent
 
 logger = logging.getLogger(__name__)
+
+VAD_SAMPLE_RATE = 16000
+VAD_FRAME_SAMPLES = 512
+
+SendCallback = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 
 
 class SessionState(str, Enum):
@@ -48,10 +73,11 @@ class SessionState(str, Enum):
 
 
 class VoiceSession:
-    """Manages full-duplex conversational audio pipeline for a single WebSocket connection.
+    """Manages the full-duplex conversational audio pipeline for one connection.
 
-    Coordinates VAD, STT, LLM, Normalization, and TTS with support for low latency,
-    streaming, cancellation, and barge-in / interruption.
+    Coordinates VAD, STT, LLM, normalization and TTS with streaming,
+    cancellation and barge-in. The ``vad`` instance must not be shared with
+    another session: it carries per-stream recurrent state.
     """
 
     def __init__(
@@ -62,7 +88,8 @@ class VoiceSession:
         llm: LLMBase,
         normalizer: IndicTextNormalizer,
         tts: TTSBase,
-        send_callback: Callable[[dict[str, Any]], Coroutine[Any, Any, None]],
+        send_callback: SendCallback,
+        memory: ConversationMemory | None = None,
     ):
         self.session_id = session_id
         self.vad = vad
@@ -74,23 +101,26 @@ class VoiceSession:
 
         self.state = SessionState.IDLE
         self.config = SessionStartConfig()
-        self.conversation_history: list[dict[str, str]] = []
-
-        # Audio buffer for handling arbitrary incoming sample rates and slicing into 512-sample frames
-        self._input_sample_accumulator = BoundedAudioAccumulator(
-            sample_rate=16000,
-            max_seconds=settings.max_speech_duration_seconds,
+        # `is not None`: an empty ConversationMemory is falsy (it defines __len__).
+        self.memory = (
+            memory
+            if memory is not None
+            else ConversationMemory(max_turns=settings.conversation_max_turns)
         )
+
         self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=settings.input_queue_maxsize
         )
-
         self._active_turn_task: asyncio.Task | None = None
         self._processor_task: asyncio.Task | None = None
         self._is_running = False
 
+    # ------------------------------------------------------------------
+    # Public lifecycle API (called by the WebSocket handler)
+    # ------------------------------------------------------------------
+
     async def start(self, config: SessionStartConfig | None = None) -> None:
-        """Start the session and begin processing audio stream."""
+        """Start the session and begin processing the audio stream."""
         if config:
             self.config = config
 
@@ -98,61 +128,50 @@ class VoiceSession:
         self._is_running = True
         self.vad.reset()
 
-        # Start audio consumer worker
-        self._processor_task = asyncio.create_task(self._process_audio_stream())
-        logger.info("Session %s started with language: %s, voice: %s", self.session_id, self.config.language, self.config.voice)
+        if self._processor_task is None or self._processor_task.done():
+            self._processor_task = asyncio.create_task(self._process_audio_stream())
+        logger.info(
+            "Session %s started (language=%s, voice=%s)",
+            self.session_id,
+            self.config.language,
+            self.config.voice,
+        )
 
     async def push_audio(self, pcm_bytes: bytes) -> None:
-        """Push raw incoming audio bytes into bounded queue."""
+        """Queue raw client PCM16 audio; drops frames if the consumer is behind."""
         if not self._is_running or self.state == SessionState.CLOSED:
             return
-
         try:
             self._audio_queue.put_nowait(pcm_bytes)
         except asyncio.QueueFull:
             logger.warning("Session %s input queue full; dropping frame", self.session_id)
 
     async def interrupt(self, reason: str = "user_speech") -> None:
-        """Cancel ongoing generation and playback immediately (Barge-in)."""
-        if self.state in (SessionState.PROCESSING, SessionState.SPEAKING):
-            logger.info("Barge-in / Interruption triggered on session %s (reason: %s)", self.session_id, reason)
-            if self._active_turn_task and not self._active_turn_task.done():
-                self._active_turn_task.cancel()
-                try:
-                    await self._active_turn_task
-                except asyncio.CancelledError:
-                    pass
-                self._active_turn_task = None
-
-            self.state = SessionState.LISTENING
-            await self._send_event(ServerInterruptedMessage(reason=reason).model_dump())
+        """Cancel ongoing generation and playback immediately (barge-in)."""
+        if self.state not in (SessionState.PROCESSING, SessionState.SPEAKING):
+            return
+        logger.info("Barge-in on session %s (reason: %s)", self.session_id, reason)
+        await self._cancel_active_turn()
+        self.state = SessionState.LISTENING
+        await self._send_event(ServerInterruptedMessage(reason=reason).model_dump())
 
     async def stop(self) -> None:
-        """Stop active session and cleanup all tasks and buffers."""
+        """Stop the session and release its tasks and buffers."""
         self._is_running = False
         self.state = SessionState.CLOSED
-
-        if self._active_turn_task and not self._active_turn_task.done():
-            self._active_turn_task.cancel()
-
-        if self._processor_task and not self._processor_task.done():
-            self._processor_task.cancel()
-
-        self._input_sample_accumulator.clear()
+        for task in (self._active_turn_task, self._processor_task):
+            if task and not task.done():
+                task.cancel()
         self.vad.reset()
         logger.info("Session %s stopped.", self.session_id)
 
-    async def _send_event(self, event_data: dict[str, Any]) -> None:
-        """Send event over WebSocket."""
-        try:
-            await self._send_callback(event_data)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to send WebSocket event on session %s: %s", self.session_id, exc)
+    # ------------------------------------------------------------------
+    # Audio input -> VAD
+    # ------------------------------------------------------------------
 
     async def _process_audio_stream(self) -> None:
-        """Background worker consuming audio chunks and feeding VAD."""
-        frame_buffer = np.empty(0, dtype=np.float32)
-
+        """Background worker: decode client audio, frame it, and feed the VAD."""
+        remainder = np.empty(0, dtype=np.float32)
         try:
             while self._is_running:
                 pcm_bytes = await self._audio_queue.get()
@@ -160,60 +179,17 @@ class VoiceSession:
                     continue
 
                 samples = pcm16_to_float32(pcm_bytes)
-                if self.config.sample_rate != 16000:
-                    samples = resample_audio(samples, self.config.sample_rate, 16000)
+                if self.config.sample_rate != VAD_SAMPLE_RATE:
+                    samples = resample_audio(samples, self.config.sample_rate, VAD_SAMPLE_RATE)
+                if len(remainder):
+                    samples = np.concatenate([remainder, samples])
 
-                # Concatenate with unaligned remainder
-                if len(frame_buffer) > 0:
-                    samples = np.concatenate([frame_buffer, samples])
-
-                # Process all complete 512-sample frames
-                frames = list(slice_into_frames(samples, frame_size=512))
-                num_processed = len(frames) * 512
-                frame_buffer = samples[num_processed:]
+                frames = list(slice_into_frames(samples, frame_size=VAD_FRAME_SAMPLES))
+                remainder = samples[len(frames) * VAD_FRAME_SAMPLES :]
 
                 for frame in frames:
-                    events = self.vad.process_chunk(frame)
-                    for event in events:
-                        # While the reply is still being computed (STT/LLM/model
-                        # swaps take a long time on 8 GB Macs), background noise
-                        # must not cancel the turn or start a second concurrent
-                        # one. Voice barge-in stays enabled once audio is playing;
-                        # the explicit client "interrupt" message always works.
-                        if self.state == SessionState.PROCESSING:
-                            logger.debug(
-                                "Ignoring VAD %s while turn is processing", event.event_type
-                            )
-                            continue
-
-                        if event.event_type == "speech_start":
-                            logger.debug("Speech start detected")
-                            # If assistant is currently speaking, trigger barge-in!
-                            if self.state == SessionState.SPEAKING:
-                                await self.interrupt(reason="user_speech")
-
-                            await self._send_event(ServerVADSpeechStartMessage().model_dump())
-
-                        elif event.event_type == "speech_end":
-                            logger.debug("Speech end detected (duration samples: %s)", event.duration_samples)
-                            duration_ms = int(event.duration_samples * 1000 / 16000)
-                            await self._send_event(
-                                ServerVADSpeechEndMessage(duration_ms=duration_ms).model_dump()
-                            )
-
-                            if self._active_turn_task and not self._active_turn_task.done():
-                                logger.debug("Previous turn still running; skipping new turn")
-                                continue
-
-                            if event.speech_audio is not None and len(event.speech_audio) > 0:
-                                # Mark busy immediately so following frames are not
-                                # treated as barge-in before the task starts running.
-                                self.state = SessionState.PROCESSING
-                                # Dispatch turn pipeline in background task
-                                self._active_turn_task = asyncio.create_task(
-                                    self._run_turn(event.speech_audio)
-                                )
-
+                    for event in self.vad.process_chunk(frame):
+                        await self._handle_vad_event(event)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -222,122 +198,65 @@ class VoiceSession:
                 ServerErrorMessage(code="AUDIO_PROCESS_ERROR", message=str(exc)).model_dump()
             )
 
+    async def _handle_vad_event(self, event: VADEvent) -> None:
+        # While a reply is being computed (STT/LLM can take seconds on 8 GB
+        # Macs), background noise must not cancel the turn or start a second
+        # concurrent one. Voice barge-in stays enabled once audio is playing;
+        # the explicit client "interrupt" message always works.
+        if self.state == SessionState.PROCESSING:
+            logger.debug("Ignoring VAD %s while turn is processing", event.event_type)
+            return
+
+        if event.event_type == "speech_start":
+            if self.state == SessionState.SPEAKING:
+                await self.interrupt(reason="user_speech")
+            await self._send_event(ServerVADSpeechStartMessage().model_dump())
+            return
+
+        if event.event_type != "speech_end":
+            return
+
+        duration_ms = int(event.duration_samples * 1000 / VAD_SAMPLE_RATE)
+        await self._send_event(ServerVADSpeechEndMessage(duration_ms=duration_ms).model_dump())
+
+        if self._active_turn_task and not self._active_turn_task.done():
+            logger.debug("Previous turn still running; skipping new turn")
+            return
+        if event.speech_audio is None or len(event.speech_audio) == 0:
+            return
+
+        # Mark busy before the task runs so following frames are not treated
+        # as barge-in.
+        self.state = SessionState.PROCESSING
+        self._active_turn_task = asyncio.create_task(self._run_turn(event.speech_audio))
+
+    # ------------------------------------------------------------------
+    # One conversational turn
+    # ------------------------------------------------------------------
+
     async def _run_turn(self, speech_audio: np.ndarray) -> None:
-        """Executes one conversational turn: STT -> LLM -> Normalization -> TTS."""
+        """Run STT -> LLM -> normalization -> TTS for one user utterance."""
+        user_message = ""
+        spoken: list[str] = []  # sentences whose audio reached the client
         try:
             self.state = SessionState.PROCESSING
-
             # Keep only one large neural model resident at a time on 8 GB Macs.
             await self.tts.release_model()
 
-            # 1. STT: Transcribe user speech
-            try:
-                stt_result = await self.stt.transcribe(
-                    speech_audio, sample_rate=16000, language=self.config.language
-                )
-            finally:
-                await self.stt.release_model()
-            user_text = stt_result.text.strip()
-            detected_lang = stt_result.language or self.config.language
-
-            await self._send_event(
-                ServerTranscriptMessage(
-                    text=user_text,
-                    language=detected_lang,
-                    is_final=True,
-                ).model_dump()
-            )
-
-            # If no speech was recognized, return to listening
+            user_text, language = await self._transcribe(speech_audio)
             if not user_text:
-                self.state = SessionState.LISTENING
                 return
 
-            # 2. LLM: Stream assistant response. When the LLM keeps its weights
-            # resident, each finished sentence goes straight to TTS while the
-            # LLM keeps generating, so the first audio doesn't wait for the
-            # whole reply. On 8 GB Macs that swap models, TTS waits instead.
-            accumulated_response = ""
-            sentence_buffer = ""
-            response_sentences: list[str] = []
-            dispatched = 0
-            overlap = (
-                settings.overlap_llm_tts
-                and not self.llm.swaps_weights
-                and not getattr(self.tts, "uses_local_mlx", False)
-            )
-            sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
-            tts_task: asyncio.Task | None = (
-                asyncio.create_task(self._tts_worker(sentence_queue, detected_lang))
-                if overlap
-                else None
-            )
+            user_message = self.memory.compose_user_message(user_text)
+            reply = await self._generate_and_speak(user_message, language, spoken)
 
-            def dispatch(sentence: str) -> None:
-                nonlocal dispatched
-                dispatched += 1
-                if tts_task is not None:
-                    sentence_queue.put_nowait(sentence)
-                else:
-                    response_sentences.append(sentence)
-
-            try:
-                try:
-                    async for token in self.llm.generate_stream(
-                        prompt=user_text,
-                        history=self.conversation_history,
-                        system_prompt=self.config.system_prompt,
-                    ):
-                        accumulated_response += token
-                        sentence_buffer += token
-
-                        await self._send_event(
-                            ServerLLMChunkMessage(
-                                delta=token,
-                                accumulated=accumulated_response,
-                            ).model_dump()
-                        )
-
-                        if any(p in token for p in (".", "!", "?", "।", "\n")) and sentence_buffer.strip():
-                            dispatch(sentence_buffer.strip())
-                            sentence_buffer = ""
-                        if tts_task is not None and tts_task.done():
-                            break  # TTS failed; stop generating and surface it below
-                finally:
-                    await self.llm.release_model()
-
-                # Synthesize the trailing text only when it is the whole reply. A
-                # fragment after a complete sentence is almost always the LLM being
-                # cut off by max_new_tokens; speaking it ends the reply mid-word.
-                if sentence_buffer.strip() and dispatched == 0:
-                    dispatch(sentence_buffer.strip())
-                elif sentence_buffer.strip():
-                    logger.debug("Skipping truncated trailing fragment: %r", sentence_buffer)
-
-                if tts_task is not None:
-                    sentence_queue.put_nowait(None)
-                    await tts_task
-                else:
-                    for sentence in response_sentences:
-                        await self._synthesize_and_stream(sentence, detected_lang)
-            finally:
-                if tts_task is not None and not tts_task.done():
-                    tts_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await tts_task
-
-            # 3. Turn complete: record conversation history
-            self.conversation_history.append({"role": "user", "content": user_text})
-            self.conversation_history.append({"role": "assistant", "content": accumulated_response.strip()})
-
+            self.memory.record_turn(user_message, " ".join(spoken))
             await self._send_event(
-                ServerTurnCompleteMessage(
-                    user_text=user_text,
-                    assistant_text=accumulated_response.strip(),
-                ).model_dump()
+                ServerTurnCompleteMessage(user_text=user_text, assistant_text=reply).model_dump()
             )
-
         except asyncio.CancelledError:
+            # Barge-in: remember what the user said and what they actually heard.
+            self.memory.record_turn(user_message, " ".join(spoken))
             logger.info("Session %s turn cancelled.", self.session_id)
             raise
         except Exception as exc:
@@ -349,37 +268,165 @@ class VoiceSession:
             if self.state != SessionState.CLOSED:
                 self.state = SessionState.LISTENING
 
-    async def _tts_worker(self, queue: "asyncio.Queue[str | None]", language: str) -> None:
-        """Speak sentences in order as the LLM produces them."""
-        while True:
-            sentence = await queue.get()
-            if sentence is None:
-                return
-            await self._synthesize_and_stream(sentence, language)
+    async def _transcribe(self, speech_audio: np.ndarray) -> tuple[str, str]:
+        """Transcribe the utterance and emit the ``transcript`` event."""
+        try:
+            result = await self.stt.transcribe(
+                speech_audio, sample_rate=VAD_SAMPLE_RATE, language=self.config.language
+            )
+        finally:
+            await self.stt.release_model()
 
-    async def _synthesize_and_stream(self, text: str, language: str) -> None:
-        """Normalize text and stream TTS chunks."""
-        # 1. Indic Text Normalization
-        normalized_text = (
+        text = result.text.strip()
+        language = result.language or self.config.language
+        await self._send_event(
+            ServerTranscriptMessage(text=text, language=language, is_final=True).model_dump()
+        )
+        return text, language
+
+    def _overlap_llm_and_tts(self) -> bool:
+        """Speak sentence 1 while the LLM still generates, when memory allows."""
+        return (
+            settings.overlap_llm_tts
+            and not self.llm.swaps_weights
+            and not getattr(self.tts, "uses_local_mlx", False)
+        )
+
+    async def _generate_and_speak(
+        self, user_message: str, language: str, spoken: list[str]
+    ) -> str:
+        """Stream the LLM reply, speak it sentence by sentence, return the full text."""
+        system_prompt = build_system_prompt(
+            self.config.system_prompt or settings.system_prompt, language
+        )
+        segmenter = SentenceSegmenter()
+        sentences: list[str] = []
+        reply = ""
+
+        queue: asyncio.Queue[str | None] | None = (
+            asyncio.Queue() if self._overlap_llm_and_tts() else None
+        )
+        tts_task = (
+            asyncio.create_task(self._speak_from_queue(queue, language, spoken))
+            if queue is not None
+            else None
+        )
+
+        def accept(sentence: str) -> None:
+            sentences.append(sentence)
+            if queue is not None:
+                queue.put_nowait(sentence)
+
+        try:
+            try:
+                async for delta in self.llm.generate_stream(
+                    prompt=user_message,
+                    history=self.memory.history(),
+                    system_prompt=system_prompt,
+                ):
+                    reply += delta
+                    await self._send_event(
+                        ServerLLMChunkMessage(delta=delta, accumulated=reply).model_dump()
+                    )
+                    for sentence in segmenter.push(delta):
+                        accept(sentence)
+                    if tts_task is not None and tts_task.done():
+                        break  # TTS failed; stop generating and surface it below
+            finally:
+                await self.llm.release_model()
+
+            # A terminated tail is the reply's last sentence. An unterminated
+            # tail after earlier sentences is almost always the LLM being cut by
+            # max_new_tokens; speaking it would end the reply mid-word.
+            tail = segmenter.flush()
+            if tail and (ends_with_terminator(tail) or not sentences):
+                accept(tail)
+            elif tail:
+                logger.debug("Skipping truncated trailing fragment: %r", tail)
+
+            if tts_task is not None and queue is not None:
+                queue.put_nowait(None)
+                await tts_task
+            else:
+                for text in group_for_synthesis(sentences, settings.tts_max_chars_per_request):
+                    await self._speak(text, language, spoken)
+        finally:
+            if tts_task is not None and not tts_task.done():
+                tts_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await tts_task
+
+        return reply.strip()
+
+    async def _speak_from_queue(
+        self, queue: "asyncio.Queue[str | None]", language: str, spoken: list[str]
+    ) -> None:
+        """Speak sentences in order as the LLM produces them."""
+        while (sentence := await queue.get()) is not None:
+            await self._speak(sentence, language, spoken)
+
+    async def _speak(self, text: str, language: str, spoken: list[str]) -> None:
+        """Normalize ``text``, synthesize it, and stream coalesced audio frames."""
+        tts_text = (
             self.normalizer.normalize(text, lang=language)
             if settings.normalization_enabled
             else text
         )
 
-        # 2. TTS audio chunk streaming
         self.state = SessionState.SPEAKING
+        sample_rate, channels = self.tts.sample_rate, 1
+        coalescer = PCM16Coalescer(sample_rate, min_ms=settings.tts_min_frame_ms)
+        heard = False
+
         async for chunk in self.tts.synthesize_stream(
-            text=normalized_text,
-            voice=self.config.voice,
-            language=language,
+            text=tts_text, voice=self.config.voice, language=language
         ):
-            b64_audio = pcm_bytes_to_base64(chunk.audio_pcm16)
-            await self._send_event(
-                ServerTTSChunkMessage(
-                    audio=b64_audio,
-                    sample_rate=chunk.sample_rate,
-                    channels=chunk.channels,
-                    format="pcm16",
-                    is_last=chunk.is_last,
-                ).model_dump()
-            )
+            if chunk.sample_rate != sample_rate or chunk.channels != channels:
+                # Format change mid-stream: flush old-format audio first.
+                await self._send_audio(coalescer.flush(), sample_rate, channels, is_last=False)
+                sample_rate, channels = chunk.sample_rate, chunk.channels
+                coalescer = PCM16Coalescer(sample_rate, settings.tts_min_frame_ms, channels)
+            frame = coalescer.push(chunk.audio_pcm16) if chunk.audio_pcm16 else None
+            if frame and await self._send_audio(frame, sample_rate, channels, is_last=False):
+                heard = True
+
+        # Always close the request with is_last=True ("smooth" playback flushes on it).
+        if await self._send_audio(coalescer.flush(), sample_rate, channels, is_last=True):
+            heard = True
+        if heard:
+            spoken.append(text)
+
+    async def _send_audio(
+        self, pcm: bytes, sample_rate: int, channels: int, *, is_last: bool
+    ) -> bool:
+        """Send one ``tts_chunk``; returns True when it carried audio."""
+        if not pcm and not is_last:
+            return False
+        await self._send_event(
+            ServerTTSChunkMessage(
+                audio=pcm_bytes_to_base64(pcm),
+                sample_rate=sample_rate,
+                channels=channels,
+                format="pcm16",
+                is_last=is_last,
+            ).model_dump()
+        )
+        return bool(pcm)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _cancel_active_turn(self) -> None:
+        task, self._active_turn_task = self._active_turn_task, None
+        if task and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _send_event(self, event_data: dict[str, Any]) -> None:
+        """Send an event to the client; a dead socket must not kill the turn."""
+        try:
+            await self._send_callback(event_data)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to send WebSocket event on session %s: %s", self.session_id, exc)
