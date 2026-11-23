@@ -93,6 +93,10 @@ services:
       SVARA_API_URL: http://svara:8080
       CLIENT_PLAYBACK_MODE: "${CLIENT_PLAYBACK_MODE:-fast}"
       SVARA_BUFFER_MS: "${SVARA_BUFFER_MS:-120}"
+      # Svara streams one voice at ~0.6x real time on an L4; later sentences are
+      # synthesized in parallel and an underrun guard keeps playback gap-free.
+      TTS_PARALLEL_REQUESTS: "${TTS_PARALLEL_REQUESTS:-3}"
+      TTS_UNDERRUN_MARGIN: "${TTS_UNDERRUN_MARGIN:-1.2}"
       LLM_MAX_NEW_TOKENS: "${LLM_MAX_NEW_TOKENS:-96}"
       OVERLAP_LLM_TTS: "${OVERLAP_LLM_TTS:-true}"
       VAD_MIN_SILENCE_DURATION_MS: "${VAD_MIN_SILENCE_DURATION_MS:-300}"

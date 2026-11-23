@@ -209,6 +209,30 @@ class Settings(BaseSettings):
             "sentences are merged into TTS requests up to this length"
         ),
     )
+    tts_parallel_requests: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "TTS requests one reply may run at once. Later sentences are synthesized "
+            "while earlier ones play; a GPU Svara server batches them almost for free"
+        ),
+    )
+    tts_assumed_realtime_factor: float = Field(
+        default=0.6,
+        gt=0,
+        description=(
+            "TTS speed (audio seconds per second) assumed until the first request is "
+            "measured. Svara on one L4 streams ~0.6x real time"
+        ),
+    )
+    tts_underrun_margin: float = Field(
+        default=1.2,
+        ge=1.0,
+        description=(
+            "Safety factor on a sentence's estimated length when deciding it may start "
+            "playing while still being synthesized (higher = fewer gaps, more latency)"
+        ),
+    )
     svara_api_timeout_seconds: float = Field(
         default=60.0, description="Timeout for one remote Svara synthesis request"
     )

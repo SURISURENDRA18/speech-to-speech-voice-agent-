@@ -42,6 +42,7 @@ Tests that need downloaded assets: `test_vad.py`, `test_tts.py::test_load_svara_
 | `voice_agent/pipeline/session.py` | `VoiceSession`: per-connection state machine and turn orchestration |
 | `voice_agent/pipeline/conversation.py` | `ConversationMemory`, `build_system_prompt` |
 | `voice_agent/pipeline/segmenter.py` | `SentenceSegmenter`, `clean_for_speech`, `group_for_synthesis` |
+| `voice_agent/pipeline/synthesis.py` | `SynthesisJob` (background TTS per sentence), underrun guard, `SynthesisRateTracker` |
 | `voice_agent/{vad,stt,llm,tts,normalization}/` | Adapters. Each has a `base.py` ABC plus MLX / PyTorch / remote / mock implementations |
 | `voice_agent/server/app.py` | Lifespan: picks adapters from settings and stores them on `app.state` |
 | `voice_agent/server/websocket.py` | `/ws/voice` handler: decodes messages, owns one `VoiceSession` |
@@ -68,7 +69,7 @@ Tests that need downloaded assets: `test_vad.py`, `test_tts.py::test_load_svara_
 
 ## Audio quality: where to look
 
-- Choppy or broken voice usually comes from too many tiny frames, scheduling gaps, or a TTS restart per sentence. The fixes live in `PCM16Coalescer` (`TTS_MIN_FRAME_MS`), `group_for_synthesis` (`TTS_MAX_CHARS_PER_REQUEST`), and the jitter buffer in `index.html` (`JITTER` constants, `playTTSChunk`).
+- Choppy or broken voice usually comes from TTS slower than real time (Svara on an L4 streams ~0.6x), too many tiny frames, scheduling gaps, or a TTS restart per sentence. Measure first: time each `tts_chunk` against its audio length. Parallel synthesis and the underrun guard live in `pipeline/synthesis.py` (`TTS_PARALLEL_REQUESTS`, `TTS_UNDERRUN_MARGIN`). The fixes live in `PCM16Coalescer` (`TTS_MIN_FRAME_MS`), `group_for_synthesis` (`TTS_MAX_CHARS_PER_REQUEST`), and the jitter buffer in `index.html` (`JITTER` constants, `playTTSChunk`).
 - Bad pronunciation of numbers or symbols: check `normalization/indic_norm.py` and `segmenter.clean_for_speech`.
 - Local Svara on base Macs is slower than real time. The client then defaults to "smooth" playback (`/v1/client-config`).
 
