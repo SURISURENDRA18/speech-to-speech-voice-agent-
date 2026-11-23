@@ -312,6 +312,8 @@ All settings live in `.env` (see [`.env.example`](.env.example)) and are loaded 
 | `CONVERSATION_MAX_TURNS` | `6` | Exchanges remembered per session and sent to the LLM |
 | `LLM_MAX_NEW_TOKENS` | `128` | Reply token cap (Indic text needs ~3 tokens/word; lower values cut replies) |
 | `TTS_MIN_FRAME_MS` | `160` | Merge tiny TTS pieces into frames at least this long (smoother playback) |
+| `TTS_PARALLEL_REQUESTS` | `3` | Sentences synthesized at once while earlier ones play |
+| `TTS_UNDERRUN_MARGIN` | `1.2` | With TTS slower than real time, buffer this much extra before a sentence plays (fewer gaps, more latency) |
 
 <details>
 <summary><b>All options</b></summary>

@@ -22,6 +22,7 @@ from voice_agent.llm import (
     Qwen3LLMAdapter,
 )
 from voice_agent.normalization import IndicTextNormalizer
+from voice_agent.pipeline.synthesis import SynthesisRateTracker, calibrate
 from voice_agent.server.websocket import voice_websocket_handler
 from voice_agent.stt import (
     FasterWhisperSTTAdapter,
@@ -57,6 +58,23 @@ async def _preload_models(*adapters: Any) -> None:
             logger.info("Preloaded %s", getattr(adapter, "model_name", adapter))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Preloading %s failed (will load on first use): %s", adapter, exc)
+
+
+async def _calibrate_tts(tts: Any, tracker: SynthesisRateTracker) -> None:
+    """Measure TTS speed once so the first reply's underrun guard uses real rates."""
+    # On 8 GB Macs local MLX Svara shares memory with the LLM; skip the extra run.
+    if getattr(tts, "uses_local_mlx", False):
+        return
+    try:
+        await calibrate(tts, tracker)
+        logger.info("Measured TTS speed: %.2fx real time", tracker.realtime_factor)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("TTS speed calibration failed (will learn from replies): %s", exc)
+
+
+async def _warm_up(stt: Any, llm: Any, tts: Any, tracker: SynthesisRateTracker) -> None:
+    await _preload_models(stt, llm, tts)
+    await _calibrate_tts(tts, tracker)
 
 
 @asynccontextmanager
@@ -158,11 +176,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             keep_loaded=use_mlx,
         )
     app.state.tts = tts
+    # Shared: it measures the TTS backend's speed, which every session sees.
+    app.state.tts_rate = SynthesisRateTracker(settings.tts_assumed_realtime_factor)
 
     preload_task: asyncio.Task | None = None
     if settings.preload_models:
         # Each adapter's preload() is a no-op when it swaps weights per turn.
-        preload_task = asyncio.create_task(_preload_models(stt, llm, tts))
+        preload_task = asyncio.create_task(_warm_up(stt, llm, tts, app.state.tts_rate))
 
     logger.info(
         "Speech-to-Speech pipeline ready (MLX: %s, CUDA: %s)", use_mlx, torch.cuda.is_available()

@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import time
 from collections.abc import AsyncGenerator
 
 import numpy as np
@@ -12,6 +13,7 @@ from voice_agent.llm.mock_llm import MockLLMAdapter
 from voice_agent.normalization.indic_norm import IndicTextNormalizer
 from voice_agent.pipeline.conversation import ConversationMemory
 from voice_agent.pipeline.session import SessionState, VoiceSession
+from voice_agent.pipeline.synthesis import SynthesisRateTracker
 from voice_agent.server.protocol import SessionStartConfig
 from voice_agent.stt.mock_stt import MockSTTAdapter
 from voice_agent.tts.base import TTSAudioChunk, TTSBase
@@ -246,4 +248,119 @@ async def test_session_barge_in_interruption():
     assert interrupted[0]["reason"] == "user_speech"
     # Nothing was spoken yet, so the user's words carry into the next turn.
     assert session.memory.compose_user_message("again") == "Test prompt again"
+    await session.stop()
+
+
+class StampedTTS(TTSBase):
+    """Each request's audio carries its own sample value; listed texts are slow."""
+
+    def __init__(self, slow_texts: set[str], pieces: int = 4, slow_delay: float = 0.05):
+        self.slow_texts = slow_texts
+        self.pieces = pieces
+        self.slow_delay = slow_delay
+        self.log: list[tuple[str, str]] = []  # (event, text)
+        self.values: dict[str, int] = {}
+
+    @property
+    def sample_rate(self) -> int:
+        return 24000
+
+    @property
+    def model_name(self) -> str:
+        return "stamped-tts"
+
+    async def synthesize_stream(self, text, voice=None, language=None):
+        value = self.values.setdefault(text, len(self.values) + 1)
+        self.log.append(("start", text))
+        for _ in range(self.pieces):
+            await asyncio.sleep(self.slow_delay if text in self.slow_texts else 0)
+            yield TTSAudioChunk(
+                audio_pcm16=np.full(2400, value, dtype=np.int16).tobytes(), sample_rate=24000
+            )
+        self.log.append(("end", text))
+        yield TTSAudioChunk(audio_pcm16=b"", sample_rate=24000, is_last=True)
+
+
+@pytest.mark.asyncio
+async def test_sentences_synthesize_in_parallel_but_play_in_order():
+    llm = RecordingLLM(["पहला वाक्य। दूसरा वाक्य।"])
+    tts = StampedTTS(slow_texts={"पहला वाक्य।"})
+    session, events = make_session(llm=llm, tts=tts)
+    session.tts_rate = SynthesisRateTracker(realtime_factor=2.0)  # never hold back
+    await session.start()
+
+    await session._run_turn(np.ones(1600, dtype=np.float32))
+
+    # The second sentence started before the slow first one finished...
+    assert tts.log.index(("start", "दूसरा वाक्य।")) < tts.log.index(("end", "पहला वाक्य।"))
+    # ...but the client still hears the first sentence completely, then the second.
+    audio = np.concatenate(
+        [
+            np.frombuffer(base64.b64decode(e["audio"]), dtype=np.int16)
+            for e in events
+            if e["type"] == "tts_chunk"
+        ]
+    )
+    first, second = tts.values["पहला वाक्य।"], tts.values["दूसरा वाक्य।"]
+    assert list(dict.fromkeys(audio.tolist())) == [first, second]
+    assert sum(1 for e in events if e["type"] == "tts_chunk" and e["is_last"]) == 2
+    assert session.memory.turns[0].assistant == "पहला वाक्य। दूसरा वाक्य।"
+    await session.stop()
+
+
+class HalfRealtimeTTS(TTSBase):
+    """Streams 40 ms of audio every 80 ms: 0.5x real time, like Svara on an L4."""
+
+    def __init__(self, pieces: int = 10):
+        self.pieces = pieces
+
+    @property
+    def sample_rate(self) -> int:
+        return 24000
+
+    @property
+    def model_name(self) -> str:
+        return "half-realtime-tts"
+
+    async def synthesize_stream(self, text, voice=None, language=None):
+        for _ in range(self.pieces):
+            await asyncio.sleep(0.08)
+            yield TTSAudioChunk(audio_pcm16=b"\x01\x00" * 960, sample_rate=24000)
+        yield TTSAudioChunk(audio_pcm16=b"", sample_rate=24000, is_last=True)
+
+
+@pytest.mark.asyncio
+async def test_slow_tts_is_held_back_until_it_can_play_without_gaps():
+    text = "यह एक वाक्य है।"
+    tts = HalfRealtimeTTS(pieces=10)  # 0.4 s of audio over 0.8 s
+    sent: list[tuple[float, float]] = []  # (send time, audio seconds)
+
+    async def sender(event: dict) -> None:
+        if event["type"] == "tts_chunk" and event["audio"]:
+            sent.append((time.monotonic(), len(base64.b64decode(event["audio"])) / 48000))
+
+    normalizer = IndicTextNormalizer(default_lang="hi", use_wfst=False)
+    session = VoiceSession(
+        session_id="slow",
+        vad=ScriptedVAD(),
+        stt=MockSTTAdapter(mock_response="नमस्ते", latency_seconds=0.0),
+        llm=RecordingLLM([text]),
+        normalizer=normalizer,
+        tts=tts,
+        send_callback=sender,
+        tts_rate=SynthesisRateTracker(
+            realtime_factor=0.5, seconds_per_char=0.4 / len(normalizer.normalize(text, lang="hi"))
+        ),
+    )
+    await session.start(SessionStartConfig(language="hi"))
+
+    await session._run_turn(np.ones(1600, dtype=np.float32))
+
+    # Replay the client's back-to-back scheduling: after playback starts it
+    # must never wait for audio (a few ms of event-loop jitter allowed).
+    assert sum(seconds for _, seconds in sent) == pytest.approx(0.4)
+    play_end = sent[0][0] + sent[0][1]
+    for arrived, seconds in sent[1:]:
+        assert arrived <= play_end + 0.03, f"underrun of {arrived - play_end:.3f}s"
+        play_end = max(play_end, arrived) + seconds
     await session.stop()

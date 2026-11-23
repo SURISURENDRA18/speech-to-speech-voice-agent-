@@ -52,6 +52,7 @@ async def voice_websocket_handler(websocket: WebSocket) -> None:
         normalizer=normalizer,
         tts=tts,
         send_callback=_send_event_to_client,
+        tts_rate=app_state.tts_rate,
     )
 
     try:

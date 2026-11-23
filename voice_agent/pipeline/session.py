@@ -39,6 +39,13 @@ from voice_agent.pipeline.segmenter import (
     ends_with_terminator,
     group_for_synthesis,
 )
+from voice_agent.pipeline.synthesis import (
+    GUARD_POLL_SECONDS,
+    PlayoutClock,
+    SynthesisJob,
+    SynthesisRateTracker,
+    reply_can_play_through,
+)
 from voice_agent.protocol import (
     ServerErrorMessage,
     ServerInterruptedMessage,
@@ -51,7 +58,7 @@ from voice_agent.protocol import (
     SessionStartConfig,
 )
 from voice_agent.stt.base import STTBase
-from voice_agent.tts.base import TTSBase
+from voice_agent.tts.base import TTSAudioChunk, TTSBase
 from voice_agent.vad.detector import SileroVADDetector, VADEvent
 
 logger = logging.getLogger(__name__)
@@ -90,6 +97,7 @@ class VoiceSession:
         tts: TTSBase,
         send_callback: SendCallback,
         memory: ConversationMemory | None = None,
+        tts_rate: SynthesisRateTracker | None = None,
     ):
         self.session_id = session_id
         self.vad = vad
@@ -107,6 +115,9 @@ class VoiceSession:
             if memory is not None
             else ConversationMemory(max_turns=settings.conversation_max_turns)
         )
+        # Measures the shared TTS backend, so the server passes one shared tracker.
+        self.tts_rate = tts_rate or SynthesisRateTracker(settings.tts_assumed_realtime_factor)
+        self._tts_slots = asyncio.Semaphore(settings.tts_parallel_requests)
 
         self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=settings.input_queue_maxsize
@@ -302,12 +313,17 @@ class VoiceSession:
         segmenter = SentenceSegmenter()
         sentences: list[str] = []
         reply = ""
+        playout = PlayoutClock()
+        jobs: list[SynthesisJob] = []
 
-        queue: asyncio.Queue[str | None] | None = (
+        # Overlap: every sentence starts synthesizing the moment the LLM emits
+        # it (up to tts_parallel_requests at once); _speak_from_queue plays them
+        # strictly in order.
+        queue: asyncio.Queue[SynthesisJob | None] | None = (
             asyncio.Queue() if self._overlap_llm_and_tts() else None
         )
         tts_task = (
-            asyncio.create_task(self._speak_from_queue(queue, language, spoken))
+            asyncio.create_task(self._speak_from_queue(queue, playout, spoken, jobs))
             if queue is not None
             else None
         )
@@ -315,7 +331,8 @@ class VoiceSession:
         def accept(sentence: str) -> None:
             sentences.append(sentence)
             if queue is not None:
-                queue.put_nowait(sentence)
+                jobs.append(self._start_synthesis(sentence, language))
+                queue.put_nowait(jobs[-1])
 
         try:
             try:
@@ -349,52 +366,82 @@ class VoiceSession:
                 await tts_task
             else:
                 for text in group_for_synthesis(sentences, settings.tts_max_chars_per_request):
-                    await self._speak(text, language, spoken)
+                    jobs.append(self._start_synthesis(text, language))
+                    await self._speak(jobs[-1], playout, spoken, jobs)
         finally:
             if tts_task is not None and not tts_task.done():
                 tts_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await tts_task
+            for job in jobs:
+                await job.cancel()
 
         return reply.strip()
 
     async def _speak_from_queue(
-        self, queue: "asyncio.Queue[str | None]", language: str, spoken: list[str]
+        self,
+        queue: "asyncio.Queue[SynthesisJob | None]",
+        playout: PlayoutClock,
+        spoken: list[str],
+        reply_jobs: list[SynthesisJob],
     ) -> None:
-        """Speak sentences in order as the LLM produces them."""
-        while (sentence := await queue.get()) is not None:
-            await self._speak(sentence, language, spoken)
+        """Play sentences in order as their synthesis jobs are queued."""
+        while (job := await queue.get()) is not None:
+            await self._speak(job, playout, spoken, reply_jobs)
 
-    async def _speak(self, text: str, language: str, spoken: list[str]) -> None:
-        """Normalize ``text``, synthesize it, and stream coalesced audio frames."""
+    def _start_synthesis(self, text: str, language: str) -> SynthesisJob:
+        """Normalize ``text`` and start synthesizing it in the background."""
         tts_text = (
             self.normalizer.normalize(text, lang=language)
             if settings.normalization_enabled
             else text
         )
+        return SynthesisJob(
+            self.tts,
+            text=text,
+            tts_text=tts_text,
+            voice=self.config.voice,
+            language=language,
+            slots=self._tts_slots,
+            tracker=self.tts_rate,
+        )
 
+    async def _speak(
+        self,
+        job: SynthesisJob,
+        playout: PlayoutClock,
+        spoken: list[str],
+        reply_jobs: list[SynthesisJob],
+    ) -> None:
+        """Stream one job's audio once the rest of the reply can play without gaps.
+
+        ``reply_jobs`` is every job of this reply in playing order; it may still
+        grow while the LLM is generating.
+        """
         self.state = SessionState.SPEAKING
-        sample_rate, channels = self.tts.sample_rate, 1
-        coalescer = PCM16Coalescer(sample_rate, min_ms=settings.tts_min_frame_ms)
-        heard = False
-
-        async for chunk in self.tts.synthesize_stream(
-            text=tts_text, voice=self.config.voice, language=language
+        while not reply_can_play_through(
+            reply_jobs[reply_jobs.index(job) :],
+            queued_seconds=playout.queued(),
+            tracker=self.tts_rate,
+            margin=settings.tts_underrun_margin,
+            holdback_seconds=settings.tts_min_frame_ms / 1000,
         ):
-            if chunk.sample_rate != sample_rate or chunk.channels != channels:
-                # Format change mid-stream: flush old-format audio first.
-                await self._send_audio(coalescer.flush(), sample_rate, channels, is_last=False)
-                sample_rate, channels = chunk.sample_rate, chunk.channels
-                coalescer = PCM16Coalescer(sample_rate, settings.tts_min_frame_ms, channels)
-            frame = coalescer.push(chunk.audio_pcm16) if chunk.audio_pcm16 else None
-            if frame and await self._send_audio(frame, sample_rate, channels, is_last=False):
-                heard = True
+            await asyncio.sleep(GUARD_POLL_SECONDS)
+
+        out = _AudioOut(self._send_audio, playout, self.tts.sample_rate)
+        backlog_sent = False
+        while (item := await job.chunks.get()) is not None:
+            if isinstance(item, Exception):
+                raise item
+            await out.write(item)
+            if not backlog_sent and job.chunks.empty():
+                await out.flush()  # the guard counted the whole backlog as sent
+                backlog_sent = True
 
         # Always close the request with is_last=True ("smooth" playback flushes on it).
-        if await self._send_audio(coalescer.flush(), sample_rate, channels, is_last=True):
-            heard = True
-        if heard:
-            spoken.append(text)
+        await out.close()
+        if out.heard:
+            spoken.append(job.text)
 
     async def _send_audio(
         self, pcm: bytes, sample_rate: int, channels: int, *, is_last: bool
@@ -430,3 +477,43 @@ class VoiceSession:
             await self._send_callback(event_data)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to send WebSocket event on session %s: %s", self.session_id, exc)
+
+
+class _AudioOut:
+    """Re-frames one TTS request's audio, sends it, and tracks client playout."""
+
+    def __init__(
+        self,
+        send: Callable[..., Coroutine[Any, Any, bool]],
+        playout: PlayoutClock,
+        sample_rate: int,
+    ):
+        self._send = send
+        self._playout = playout
+        self._rate, self._channels = sample_rate, 1
+        self._coalescer = PCM16Coalescer(sample_rate, min_ms=settings.tts_min_frame_ms)
+        self.heard = False
+
+    async def write(self, chunk: TTSAudioChunk) -> None:
+        if chunk.sample_rate != self._rate or chunk.channels != self._channels:
+            # Format change mid-stream: flush old-format audio first.
+            await self._emit(self._coalescer.flush(), is_last=False)
+            self._rate, self._channels = chunk.sample_rate, chunk.channels
+            self._coalescer = PCM16Coalescer(
+                self._rate, settings.tts_min_frame_ms, self._channels
+            )
+        frame = self._coalescer.push(chunk.audio_pcm16) if chunk.audio_pcm16 else None
+        if frame:
+            await self._emit(frame, is_last=False)
+
+    async def flush(self) -> None:
+        """Send whatever the coalescer is holding, mid-request."""
+        await self._emit(self._coalescer.flush(), is_last=False)
+
+    async def close(self) -> None:
+        await self._emit(self._coalescer.flush(), is_last=True)
+
+    async def _emit(self, pcm: bytes, *, is_last: bool) -> None:
+        if await self._send(pcm, self._rate, self._channels, is_last=is_last):
+            self.heard = True
+            self._playout.sent(len(pcm) / (2 * self._channels * self._rate))

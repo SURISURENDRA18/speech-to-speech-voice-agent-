@@ -80,6 +80,8 @@ This system implements a full-duplex, low-latency, speech-to-speech conversation
 - **Smooth playback** (why the voice does not break up):
   - Server: `PCM16Coalescer` merges tiny TTS pieces (remote HTTP streams arrive a few ms at a time) into frames of at least `TTS_MIN_FRAME_MS` (160 ms), and keeps them sample-aligned.
   - Server: without LLM/TTS overlap (8 GB Macs), `group_for_synthesis` merges sentences into TTS requests of up to `TTS_MAX_CHARS_PER_REQUEST`, so Svara isn't restarted for every sentence.
+  - Server (`pipeline/synthesis.py`): Svara on one L4 streams a single voice at only ~0.6x real time, but vLLM batches concurrent requests almost for free. With LLM/TTS overlap, each sentence becomes a `SynthesisJob` the moment the LLM emits it (up to `TTS_PARALLEL_REQUESTS` at once), so later sentences are generated while earlier ones play; jobs are played strictly in order.
+  - Server: the underrun guard (`reply_can_play_through`) holds the next sentence until it **and every later sentence already synthesizing** can play back to back: for each, `queued ahead + buffered >= remaining * (1/r - 1)` (`safe_to_start`). `r` and the audio length per character are measured on real requests by the shared `SynthesisRateTracker`; `PlayoutClock` estimates the client's queued audio. An unavoidable wait therefore happens before speech starts, not mid-reply. On a TTS faster than real time it never waits.
   - Browser: an adaptive jitter buffer schedules audio 120 ms ahead and widens the lead (up to 600 ms) after each mid-reply underrun. A 4 ms fade-in removes clicks when playback restarts after a gap.
 
 ---
